@@ -168,6 +168,14 @@
    (progn (run %{exe:cram.exe} -test run.t) (diff? run.t run.t.corrected)))))
 
 (alias
+ (name env-variables)
+ (deps (package dune) (source_tree test-cases/env-variables))
+ (action
+  (chdir
+   test-cases/env-variables
+   (progn (run %{exe:cram.exe} -test run.t) (diff? run.t run.t.corrected)))))
+
+(alias
  (name envs-and-contexts)
  (deps (package dune) (source_tree test-cases/envs-and-contexts))
  (action
@@ -988,6 +996,7 @@
   (alias dup-fields)
   (alias env)
   (alias env-tracking)
+  (alias env-variables)
   (alias exclude-missing-module)
   (alias exec-cmd)
   (alias exec-missing)
@@ -1108,6 +1117,7 @@
   (alias dup-fields)
   (alias env)
   (alias env-tracking)
+  (alias env-variables)
   (alias exclude-missing-module)
   (alias exec-cmd)
   (alias exec-missing)

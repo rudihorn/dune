@@ -87,6 +87,9 @@ let rec find l ~f =
   | [] -> None
   | x :: l -> if f x then Some x else find l ~f
 
+let exists l ~f =
+  find l ~f |> Option.is_some
+
 let find_exn l ~f =
   match find l ~f with
   | Some x -> x

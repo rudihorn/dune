@@ -1,0 +1,108 @@
+open Dune;;
+open Stdune;;
+open Fiber.O;;
+open Memoization;;
+open Memoization.Memoize;;
+
+Fiber.return 5;;
+[%%expect{|
+- : int Fiber.t = <abstr>
+|}]
+
+(* to run a computation *)
+let runstr f v = f v |> Fiber.run;;
+
+(* the trivial dependencies are simply the identity function *)
+let compdep x = Fiber.return (x ^ x);;
+
+(* our two dependencies are called some and another *)
+let mcompdep1 = memoization "some" string_input_spec string_output_spec compdep;;
+let mcompdep2 = memoization "another" string_input_spec string_output_spec compdep;;
+
+(* compute the dependencies once so they are present in the
+   global hash table *)
+runstr mcompdep1 "a";;
+runstr mcompdep2 "a";;
+
+[%%expect{|
+val runstr : ('a -> 'b Fiber.t) -> 'a -> 'b = <fun>
+val compdep : string -> string Fiber.t = <fun>
+val mcompdep1 : string -> string Fiber.t = <fun>
+val mcompdep2 : string -> string Fiber.t = <fun>
+- : string = "aa"
+- : string = "aa"
+|}]
+
+(* define a counter so we can track how often our computation
+   has been run *)
+let counter = ref 0;;
+
+(* our computation increases the counter, adds the two
+   dependencies, "some" and "another" and works by multiplying
+   the input by two *)
+let comp x = 
+  Fiber.return x >>=
+  mcompdep1 >>=
+  mcompdep2 >>=
+  (fun a -> counter := !counter + 1; String.sub a 0 (String.length a |> min 3) |> Fiber.return);;
+
+let mcomp = memoization "test" string_input_spec string_output_spec comp;;
+
+[%%expect{|
+val counter : int ref = {contents = 0}
+val comp : string -> string Fiber.t = <fun>
+val mcomp : string -> string Fiber.t = <fun>
+|}]
+
+(* running it the first time should increase the counter,
+   running it again should not, but should still return the
+   same result *)
+!counter;;
+runstr mcomp "a";; 
+!counter;;
+runstr mcomp "a";; 
+!counter;;
+
+[%%expect{|
+- : int = 0
+- : string = "aaa"
+- : int = 1
+- : string = "aaa"
+- : int = 1
+|}]
+
+get_deps "test" "a";;
+
+[%%expect{|
+- : (string * string) list option = Some [("another", "aa"); ("some", "a")]
+|}]
+
+(* running it on a new input should cause it to recompute
+   the first time it is run *)
+runstr mcomp "hello";; 
+!counter;;
+runstr mcomp "hello";; 
+!counter;;
+
+[%%expect{|
+- : string = "hel"
+- : int = 2
+- : string = "hel"
+- : int = 2
+|}]
+
+(* updating the first dependency should require recomputation
+   of mcomp 7 *)
+runstr mcompdep1 "testtest";;
+runstr mcomp "hello";;
+!counter;;
+runstr mcomp "hello";;
+!counter;;
+
+[%%expect{|
+- : string = "testtesttesttest"
+- : string = "hel"
+- : int = 2
+- : string = "hel"
+- : int = 2
+|}]

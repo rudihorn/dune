@@ -30,6 +30,24 @@ test-js:
 
 test-all:
 	$(BIN) build @runtest @runtest-js
+test-js:
+	$(BIN) build @runtest-js
+
+test-all:
+	$(BIN) build @runtest @runtest-js
+
+promote:
+	$(BIN) promote
+
+test-js:
+	$(BIN) build @runtest-js
+
+test-all:
+	$(BIN) build @runtest @runtest-js
+
+promote:
+	$(BIN) promote
+
 
 promote:
 	$(BIN) promote
@@ -74,4 +92,5 @@ opam-release:
 	dune-release distrib --skip-build --skip-lint --skip-tests
 	dune-release publish distrib --verbose
 	dune-release opam pkg
-	dune-release opam submit
+	dune-release opam submitruntest-no-deps
+

@@ -33,6 +33,8 @@ val find     : 'a t -> f:('a -> bool     ) -> 'a option
 val find_exn : 'a t -> f:('a -> bool     ) -> 'a
 val find_map : 'a t -> f:('a -> 'b option) -> 'b option
 
+val exists   : 'a t -> f:('a -> bool     ) -> bool
+
 val last : 'a t -> 'a option
 
 val        sort : 'a t -> compare:('a -> 'a -> Ordering.t) -> 'a t

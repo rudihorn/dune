@@ -20,6 +20,37 @@ let string_input_spec = {
   not_equal = fun s1 s2 -> s1 <> s2;
 }
 
+let show pp v =
+  let bf = Buffer.create 128 in
+  let fmt = Format.formatter_of_buffer bf in
+  pp fmt v;
+  Format.pp_print_flush fmt ();
+  Buffer.contents bf
+
+let pair_l_input_spec s1 _s2 = {
+  serialize = (fun (a,_) -> s1.serialize a);
+  print = (fun (a,_) -> s1.print a);
+  not_equal = fun (s1,_) (s2,_) -> s1 <> s2;
+}
+
+let pair_r_input_spec _s1 s2 = {
+  serialize = (fun (_,b) -> s2.serialize b);
+  print = (fun (_,b) -> s2.print b);
+  not_equal = fun (_,s1) (_,s2) -> s1 <> s2;
+}
+
+let path_input_spec = {
+  serialize = (show Path.pp);
+  print = (show Path.pp);
+  not_equal = fun s1 s2 -> s1 <> s2;
+}
+
+let dummy_input_spec = {
+  serialize = (fun _ -> "");
+  print = (fun _ -> "dummy");
+  not_equal = fun _ _ -> true;
+}
+
 
 type compare_policy =
   | Output
@@ -101,10 +132,12 @@ module Memoize = struct
   let last_global_output_exn (name : name) (inp : ser_input) =
     last_global_cache name inp |> Option.value_exn |> (fun r -> r.last_output)
 
-  let memoization (name : name) (in_spec : 'a input_spec) (out_spec : 'b output_spec) (comp : 'a -> 'b Fiber.t) : ('a -> 'b Fiber.t) =
-    let cache = {
+  let create_cache () =
+    {
       cache = Hashtbl.create 256;
-    } in
+    } 
+
+  let memoization (cache : 'b t) (name : name) (in_spec : 'a input_spec) (out_spec : 'b output_spec) (comp : 'a -> 'b Fiber.t) : ('a -> 'b Fiber.t) =
     (fun inp -> 
       let ser_inp = in_spec.serialize inp in
       Fiber.return inp >>= add_dep name ser_inp >>= (fun inp -> 
@@ -118,7 +151,7 @@ module Memoize = struct
             let goinfo = {
               last_deps = List.map ~f:(fun (d,i) -> d, i, last_global_output_exn d i) deps;
               last_output = out_spec.serialize res;
-              default_compare = res.default_compare;
+              default_compare = out_spec.default_compare;
             } in
             update_global_cache name ser_inp goinfo;
             Fiber.return res
@@ -130,8 +163,30 @@ module Memoize = struct
             if dependencies_updated rinfo then
               recompute 
             else
+              (* TODO: recompute rather than value_exn *)
               let lcache = last_output_cache cache name ser_inp |> Option.value_exn in
               Fiber.return lcache.last_output
       )
     )
 end
+
+(*
+let _ = Path.set_root (Path.External.cwd ())
+let _ = Path.set_build_dir (Path.Kind.of_string "_build")
+
+let file_tree = Path.of_string "/home/rhorn/Documents/functors" |> File_tree.load 
+
+let _ = Format.printf "%s" (show File_tree.pp file_tree)
+
+(* let file_tree = File_tree.load Path.root
+
+let _ = Path.External.of_string "/home/rhorn/Documents/functors" |> Path.set_root *)
+
+let stp = Main.setup () |> Fiber.run
+
+
+let conf = Dune_load.load ()
+
+let _gr = Gen_rules.gen ~contexts:stp.contexts ~build_system:stp.build_system conf
+
+*)

@@ -1,8 +1,8 @@
 open !Stdune
 
-type name = string
 type ser_input = string
 type ser_output = string
+type name = string
 
 type 'a input_spec = {
   serialize : 'a -> ser_input;
@@ -11,20 +11,32 @@ type 'a input_spec = {
 }
 
 val string_input_spec : string input_spec;;
+val dummy_input_spec : 'a input_spec;;
+val path_input_spec : Path.t input_spec;;
+val pair_l_input_spec : 'a input_spec -> 'b input_spec -> ('a * 'b) input_spec
+val pair_r_input_spec : 'a input_spec -> 'b input_spec -> ('a * 'b) input_spec
+
+type compare_policy =
+  | Output
+  | Recompute
+
 
 type 'a output_spec = {
   serialize : 'a -> ser_output;
   print : 'a -> string;
-  default_compare : bool option;
+  default_compare : compare_policy;
 }
 
 val string_output_spec : string output_spec;;
 val eager_function_output_spec : 'a output_spec;;
-val lazy_function_output_spec : 'a output_spec;;
 
 
 module Memoize : sig
-  val memoization : name -> 'a input_spec -> 'b output_spec -> ('a -> 'b Fiber.t) -> ('a -> 'b Fiber.t)
+  type 'a t 
+
+  val create_cache : unit -> 'a t
+
+  val memoization : 'b t -> name -> 'a input_spec -> 'b output_spec -> ('a -> 'b Fiber.t) -> ('a -> 'b Fiber.t)
 
   val get_deps : name -> ser_input -> (name * ser_input) list option
 

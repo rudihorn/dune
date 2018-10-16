@@ -44,7 +44,8 @@ let comp x =
   Fiber.return x >>=
   mcompdep1 >>=
   mcompdep2 >>=
-  (fun a -> counter := !counter + 1; String.sub a 0 (String.length a |> min 3) |> Fiber.return);;
+  (fun a -> counter := !counter + 1; String.sub a 0 (String.length a |> min 3) |> Fiber.retir.t
+urn);;
 
 let mcomp = memoization "test" string_input_spec string_output_spec comp;;
 

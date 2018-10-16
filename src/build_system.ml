@@ -1,6 +1,7 @@
 open! Stdune
 open Import
 open Fiber.O
+open Memoization
 
 module Vspec = Build.Vspec
 
@@ -447,6 +448,7 @@ type t =
   ; hook : hook -> unit
   ; (* Package files are part of *)
     packages : Package.Name.t Path.Table.t
+  ; load_dir_cache : Path.Set.t Memoize.t
   }
 
 let string_of_paths set =
@@ -912,46 +914,72 @@ and load_dir   t ~dir = ignore (load_dir_and_get_targets t ~dir : Path.Set.t)
 and targets_of t ~dir =         load_dir_and_get_targets t ~dir
 
 and load_dir_and_get_targets t ~dir =
-  match get_dir_status t ~dir with
-  | Failed_to_load -> raise Already_reported
+  let res = dir |> load_dir_and_get_targets_mem t |> Fiber.run in
+  Path.Set.to_list res |> List.iter ~f:(fun i -> "dep " ^ Path.to_string i |> print_endline);
+  res
+  
+and fallback_collector t ~dir ~(collector : Dir_status.rules_collector) = 
+  let lazy_generators =
+    match collector.stage with
+    | Loading ->
+      die "recursive dependency between directories:\n    %s"
+        (String.concat ~sep:"\n--> "
+            (List.map t.load_dir_stack ~f:Utils.describe_target))
+    | Pending { lazy_generators } ->
+      collector.stage <- Loading;
+      lazy_generators
+  in
 
-  | Loaded targets -> targets
+  collector.stage <- Loading;
+  t.load_dir_stack <- dir :: t.load_dir_stack;
 
-  | Forward dir' ->
-    load_dir t ~dir:dir';
-    begin match get_dir_status t ~dir with
-    | Loaded targets -> targets
-    | _ -> assert false
-    end
+  try
+    load_dir_step2_exn t ~dir ~collector ~lazy_generators
+  with exn ->
+    print_endline "some_exn";
+    (match Path.Table.find t.dirs dir with
+      | Some (Loaded _) -> ()
+      | _ ->
+        (match t.load_dir_stack with
+        | [] -> assert false
+        | x :: l ->
+          t.load_dir_stack <- l;
+          assert (Path.equal x dir)));
+    Path.Table.replace t.dirs ~key:dir ~data:Failed_to_load;
+    reraise exn 
 
-  | Collecting_rules collector ->
-    let lazy_generators =
-      match collector.stage with
-      | Loading ->
-        die "recursive dependency between directories:\n    %s"
-          (String.concat ~sep:"\n--> "
-             (List.map t.load_dir_stack ~f:Utils.describe_target))
-      | Pending { lazy_generators } ->
-        collector.stage <- Loading;
-        lazy_generators
-    in
+and compute_dir t dir = 
+  "test " ^ Path.to_string dir |> print_endline;
+  let res =
+    if Path.is_in_source_tree dir then
+      File_tree.files_of t.file_tree dir |> Fiber.return
+    else if Path.equal dir Path.build_dir then
+      (* Not allowed to look here *)
+      Path.Set.empty |> Fiber.return
+    else if not (Path.is_managed dir) then
+      (match Path.readdir_unsorted dir with
+      | exception _ -> Path.Set.empty
+      | files ->
+        Path.Set.of_list (List.map files ~f:(Path.relative dir))) |> Fiber.return
+    else begin
+      let (ctx, sub_dir) = Option.value_exn (Path.extract_build_context dir) in
+      if ctx = ".aliases" then
+        Path.(append build_dir) sub_dir |> load_dir_and_get_targets_mem t 
+      else if ctx <> "install" && not (String.Map.mem t.contexts ctx) then
+        Path.Set.empty |> Fiber.return
+      else
+        let collector : Dir_status.rules_collector = 
+          { rules   = []
+          ; aliases = String.Map.empty
+          ; stage   = Pending { lazy_generators = [] }
+          } in
+        fallback_collector t ~dir:dir ~collector:collector |> Fiber.return
+      end in
+  res
 
-    collector.stage <- Loading;
-    t.load_dir_stack <- dir :: t.load_dir_stack;
-
-    try
-      load_dir_step2_exn t ~dir ~collector ~lazy_generators
-    with exn ->
-      (match Path.Table.find t.dirs dir with
-       | Some (Loaded _) -> ()
-       | _ ->
-         (match t.load_dir_stack with
-          | [] -> assert false
-          | x :: l ->
-            t.load_dir_stack <- l;
-            assert (Path.equal x dir)));
-      Path.Table.replace t.dirs ~key:dir ~data:Failed_to_load;
-      reraise exn
+and load_dir_and_get_targets_mem t =
+  let comp = fun v -> "call " ^ Path.to_string v |> print_endline; Fiber.return v >>= (compute_dir t) in
+  Memoize.memoization t.load_dir_cache "load_dir_and_get_targets" path_input_spec eager_function_output_spec comp
 
 and load_dir_step2_exn t ~dir ~collector ~lazy_generators =
   List.iter lazy_generators ~f:(fun f -> f ());
@@ -1272,6 +1300,7 @@ let create ~contexts ~file_tree ~hook =
     ; files_of = Path.Table.create 1024
     ; prefix = None
     ; hook
+    ; load_dir_cache = Memoize.create_cache ()
     }
   in
   Hooks.End_of_build.once (fun () -> finalize t);

@@ -28,9 +28,19 @@ type 'a output_spec = {
   default_compare : compare_policy;
 }
 
+val int_output_spec : int output_spec;;
 val string_output_spec : string output_spec;;
 val eager_function_output_spec : 'a output_spec;;
 
+module CRef : sig 
+  type ('a, 'b) t = 'a -> 'b Fiber.t
+
+  type ('a, 'b) comp
+
+  val deferred : unit -> ('a, 'b) comp
+  val set : ('a, 'b) comp -> ('a, 'b) t -> unit
+  val get : ('a, 'b) comp -> ('a, 'b) t
+end
 
 module Memoize : sig
   type 'a t 

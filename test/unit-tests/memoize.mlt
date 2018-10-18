@@ -109,39 +109,72 @@ runstr mcomp "hello";;
 - : int = 2
 |}]
 
-let dummy x =
-  Fiber.return x >>| string_of_int 
+let ismemcached = create_cache ();;
 
-let imemcached = create_cache ();;
-let mcompcycle = ref dummy;;
-
-counter := 0;;
 let stack = ref [];;
-
 let dump_stack v =
   get_call_stack >>| (fun s -> stack := s; v);;
 
-let compcycle x = 
-  Fiber.return x
-  >>= dump_stack
-  >>= (fun x ->
-        counter := !counter + 1;
-        if !counter < 20 then
-          !mcompcycle ((x + 1) mod 3)
-        else
-          Fiber.never
-      );;
-
-mcompcycle := memoization imemcached "cycle" int_input_spec string_output_spec compcycle;; 
+let mcompcycle =
+  let mcompcycle = CRef.deferred () in
+  let compcycle x = 
+    Fiber.return x
+    >>= dump_stack
+    >>= (fun x ->
+          counter := !counter + 1;
+          if !counter < 20 then
+            ((x + 1) mod 3) |> CRef.get mcompcycle
+          else
+            Fiber.never
+        ) in
+  memoization ismemcached "cycle" int_input_spec string_output_spec compcycle |> CRef.set mcompcycle;
+  CRef.get mcompcycle;;
 
 [%%expect{|
-val dummy : int -> string Fiber.t = <fun>
-val imemcached : '_weak2 t = <abstr>
-val mcompcycle : (int -> string Fiber.t) ref = {contents = <fun>}
-val compcycle : int -> string Fiber.t = <fun>
-- : unit = ()
+val ismemcached : '_weak2 t = <abstr>
+val stack : '_weak3 list ref = {contents = []}
+val dump_stack : 'a -> 'a Fiber.t = <fun>
+val mcompcycle : (int, string) CRef.t = <fun>
 |}]
 
-!mcompcycle 5 |> Fiber.run;;
+counter := 0;
+mcompcycle 5 |> Fiber.run;;
 !counter;;
 !stack;;
+
+[%%expect{|
+Exception: Never.
+Raised at file "src/fiber/fiber.ml", line 428, characters 20-25
+Called from file "toplevel/toploop.ml", line 180, characters 17-56
+- : int = 4
+- : (string * string) list =
+[("cycle", "2"); ("cycle", "1"); ("cycle", "0"); ("cycle", "5")]
+|}]
+
+let iimemcached = create_cache ();;
+
+let mfib = 
+  let mfib = CRef.deferred () in
+  let compfib x =
+    let mfib = CRef.get mfib in
+    counter := !counter + 1;
+    if x <= 1 then
+      Fiber.return x
+    else
+      mfib (x - 1)
+      >>= (fun r1 ->
+        mfib (x - 2)
+        >>| fun r2 -> r1 + r2) in
+  memoization iimemcached "fib" int_input_spec int_output_spec compfib |> CRef.set mfib;
+  CRef.get mfib;;
+
+counter := 0;
+mfib 2000 |> Fiber.run;;
+!counter;;
+
+[%%expect{|
+val iimemcached : '_weak4 t = <abstr>
+val mfib : (int, int) CRef.t = <fun>
+- : int = 2406280077793834213
+- : int = 2001
+|}]

@@ -15,9 +15,11 @@ let runstr f v = f v |> Fiber.run;;
 (* the trivial dependencies are simply the identity function *)
 let compdep x = Fiber.return (x ^ x);;
 
+let memcache = create_cache ();;
+
 (* our two dependencies are called some and another *)
-let mcompdep1 = memoization "some" string_input_spec string_output_spec compdep;;
-let mcompdep2 = memoization "another" string_input_spec string_output_spec compdep;;
+let mcompdep1 = memoization memcache "some" string_input_spec string_output_spec compdep;;
+let mcompdep2 = memoization memcache "another" string_input_spec string_output_spec compdep;;
 
 (* compute the dependencies once so they are present in the
    global hash table *)
@@ -27,6 +29,7 @@ runstr mcompdep2 "a";;
 [%%expect{|
 val runstr : ('a -> 'b Fiber.t) -> 'a -> 'b = <fun>
 val compdep : string -> string Fiber.t = <fun>
+val memcache : '_weak1 t = <abstr>
 val mcompdep1 : string -> string Fiber.t = <fun>
 val mcompdep2 : string -> string Fiber.t = <fun>
 - : string = "aa"
@@ -44,10 +47,9 @@ let comp x =
   Fiber.return x >>=
   mcompdep1 >>=
   mcompdep2 >>=
-  (fun a -> counter := !counter + 1; String.sub a 0 (String.length a |> min 3) |> Fiber.retir.t
-urn);;
+  (fun a -> counter := !counter + 1; String.sub a 0 (String.length a |> min 3) |> Fiber.return);;
 
-let mcomp = memoization "test" string_input_spec string_output_spec comp;;
+let mcomp = memoization memcache "test" string_input_spec string_output_spec comp;;
 
 [%%expect{|
 val counter : int ref = {contents = 0}
@@ -92,8 +94,7 @@ runstr mcomp "hello";;
 - : int = 2
 |}]
 
-(* updating the first dependency should require recomputation
-   of mcomp 7 *)
+(* updating the first dependency should require recomputation of mcomp 7 *)
 runstr mcompdep1 "testtest";;
 runstr mcomp "hello";;
 !counter;;
@@ -107,3 +108,40 @@ runstr mcomp "hello";;
 - : string = "hel"
 - : int = 2
 |}]
+
+let dummy x =
+  Fiber.return x >>| string_of_int 
+
+let imemcached = create_cache ();;
+let mcompcycle = ref dummy;;
+
+counter := 0;;
+let stack = ref [];;
+
+let dump_stack v =
+  get_call_stack >>| (fun s -> stack := s; v);;
+
+let compcycle x = 
+  Fiber.return x
+  >>= dump_stack
+  >>= (fun x ->
+        counter := !counter + 1;
+        if !counter < 20 then
+          !mcompcycle ((x + 1) mod 3)
+        else
+          Fiber.never
+      );;
+
+mcompcycle := memoization imemcached "cycle" int_input_spec string_output_spec compcycle;; 
+
+[%%expect{|
+val dummy : int -> string Fiber.t = <fun>
+val imemcached : '_weak2 t = <abstr>
+val mcompcycle : (int -> string Fiber.t) ref = {contents = <fun>}
+val compcycle : int -> string Fiber.t = <fun>
+- : unit = ()
+|}]
+
+!mcompcycle 5 |> Fiber.run;;
+!counter;;
+!stack;;

@@ -914,11 +914,54 @@ and load_dir   t ~dir = ignore (load_dir_and_get_targets t ~dir : Path.Set.t)
 and targets_of t ~dir =         load_dir_and_get_targets t ~dir
 
 and load_dir_and_get_targets t ~dir =
+  match get_dir_status t ~dir with
+  | Failed_to_load -> raise Already_reported
+
+  | Loaded targets -> targets
+
+  | Forward dir' ->
+    load_dir t ~dir:dir';
+    begin match get_dir_status t ~dir with
+    | Loaded targets -> targets
+    | _ -> assert false
+    end
+
+  | Collecting_rules collector ->
+    let lazy_generators =
+      match collector.stage with
+      | Loading ->
+        die "recursive dependency between directories:\n    %s"
+          (String.concat ~sep:"\n--> "
+             (List.map t.load_dir_stack ~f:Utils.describe_target))
+      | Pending { lazy_generators } ->
+        collector.stage <- Loading;
+        lazy_generators
+    in
+
+    collector.stage <- Loading;
+    t.load_dir_stack <- dir :: t.load_dir_stack;
+
+    try
+      load_dir_step2_exn t ~dir ~collector ~lazy_generators
+    with exn ->
+      (match Path.Table.find t.dirs dir with
+       | Some (Loaded _) -> ()
+       | _ ->
+         (match t.load_dir_stack with
+          | [] -> assert false
+          | x :: l ->
+            t.load_dir_stack <- l;
+            assert (Path.equal x dir)));
+      Path.Table.replace t.dirs ~key:dir ~data:Failed_to_load;
+      reraise exn
+
+(*
+and load_dir_and_get_targets t ~dir =
   let res = dir |> load_dir_and_get_targets_mem t |> Fiber.run in
   Path.Set.to_list res |> List.iter ~f:(fun i -> "dep " ^ Path.to_string i |> print_endline);
-  res
+  res *)
   
-and fallback_collector t ~dir ~(collector : Dir_status.rules_collector) = 
+and _fallback_collector t ~dir ~(collector : Dir_status.rules_collector) = 
   let lazy_generators =
     match collector.stage with
     | Loading ->
@@ -948,7 +991,7 @@ and fallback_collector t ~dir ~(collector : Dir_status.rules_collector) =
     Path.Table.replace t.dirs ~key:dir ~data:Failed_to_load;
     reraise exn 
 
-and compute_dir t dir = 
+and _compute_dir t dir = 
   "test " ^ Path.to_string dir |> print_endline;
   let res =
     if Path.is_in_source_tree dir then
@@ -964,7 +1007,7 @@ and compute_dir t dir =
     else begin
       let (ctx, sub_dir) = Option.value_exn (Path.extract_build_context dir) in
       if ctx = ".aliases" then
-        Path.(append build_dir) sub_dir |> load_dir_and_get_targets_mem t 
+        Path.(append build_dir) sub_dir |> _load_dir_and_get_targets_mem t 
       else if ctx <> "install" && not (String.Map.mem t.contexts ctx) then
         Path.Set.empty |> Fiber.return
       else
@@ -973,12 +1016,12 @@ and compute_dir t dir =
           ; aliases = String.Map.empty
           ; stage   = Pending { lazy_generators = [] }
           } in
-        fallback_collector t ~dir:dir ~collector:collector |> Fiber.return
+        _fallback_collector t ~dir:dir ~collector:collector |> Fiber.return
       end in
   res
 
-and load_dir_and_get_targets_mem t =
-  let comp = fun v -> "call " ^ Path.to_string v |> print_endline; Fiber.return v >>= (compute_dir t) in
+and _load_dir_and_get_targets_mem t =
+  let comp = fun v -> "call " ^ Path.to_string v |> print_endline; Fiber.return v >>= (_compute_dir t) in
   Memoize.memoization t.load_dir_cache "load_dir_and_get_targets" path_input_spec eager_function_output_spec comp
 
 and load_dir_step2_exn t ~dir ~collector ~lazy_generators =

@@ -1,4 +1,5 @@
 open !Stdune
+open Import
 (* open Staged *)
 open Fiber.O
 
@@ -69,6 +70,12 @@ type 'a output_spec = {
   default_compare : compare_policy;
 }
 
+let int_output_spec = {
+  serialize = string_of_int;
+  print = string_of_int;
+  default_compare = Output;
+}
+
 let string_output_spec = {
   serialize = id;
   print = id;
@@ -93,11 +100,44 @@ type global_cache_info = {
 
 let global_cache_table : (name * ser_input, global_cache_info) Hashtbl.t = Hashtbl.create 256
 
+module Id = struct
+  include IdGen
+
+  let idgen = IdGen.create ()
+  let gen () = IdGen.gen idgen 
+end
+
+
+module CRef = struct
+  type ('a, 'b) t = 'a -> 'b Fiber.t
+
+  type ('a, 'b) state =
+  | Empty 
+  | Full of ('a, 'b) t
+
+  type ('a, 'b) comp = {
+    mutable state : ('a, 'b) state
+  }
+
+  let deferred () = { state = Empty }
+
+  let set comp f =
+    match comp.state with
+    | Empty -> comp.state <- Full f
+    | Full _ -> die "Computation already set."
+
+  let get comp =
+    match comp.state with
+    | Empty -> die "Computation not set."
+    | Full f -> f
+end
+
 
 module Memoize = struct
 
   type 'output output_cache = {
     state : 'output run_state;
+    id : Id.t;
   }
 
   type 'out t = {
@@ -107,21 +147,23 @@ module Memoize = struct
   (* fiber context variable keys *)
   let dep_key = Fiber.Var.create ()
   let call_stack_key = Fiber.Var.create ()
+  let get_call_stack_int =
+    Fiber.Var.get call_stack_key (* get call stack *)
+      >>| Option.value ~default:([], Id.Set.empty) (* default call stack is empty *)
 
   let get_call_stack =
-    Fiber.Var.get call_stack_key (* get call stack *)
-      >>| Option.value ~default:[] (* default call stack is empty *)
+    get_call_stack_int >>| (fun (stack,_) -> stack)
 
   (* set up the fiber so that it both has an up to date call stack
      as well as an empty dependency table *)
-  let wrap_fiber (add_stack : name * ser_input) (f : 'a Fiber.t) =
+  let wrap_fiber (add_stack : name * ser_input) id (f : 'a Fiber.t) =
     (* transform f so it returns the dependencies after the computation *)
     let f = f >>= fun res -> Fiber.Var.get_exn dep_key >>= (fun deps -> Fiber.return (res,!deps)) in
     (* change f so it sets up a new dependency table before computation *)
     let f = Fiber.Var.set dep_key (ref []) f in
     (* set the context so that f has the call stack  *)
-    get_call_stack
-      >>| (fun stack -> add_stack :: stack) (* add top entry *)
+    get_call_stack_int
+      >>| (fun (stack, set) -> add_stack :: stack, Id.Set.add id set) (* add top entry *)
       >>= (fun stack -> Fiber.Var.set call_stack_key stack f) (* update *)
 
   let dump_stack v =
@@ -129,9 +171,17 @@ module Memoize = struct
       >>| List.iter ~f:(fun (n,v) -> n ^ " " ^ v |> print_endline)
       >>| (fun _ -> v)
 
+  (*
   let find_cycle name input v =
     get_call_stack
       >>| List.iter ~f:(fun stack_entry -> if stack_entry = (name, input) then failwith "cycle detected")
+      >>| (fun _ -> v) *)
+
+  let find_cycle id v =
+    get_call_stack_int
+      >>| (fun (_stack,set) ->
+             if Id.Set.mem id set then
+               die "Cycle detected:")
       >>| (fun _ -> v)
 
   let add_dep (dep : string) (inp : ser_input) x =
@@ -179,16 +229,18 @@ module Memoize = struct
       cache = Hashtbl.create 256;
     }
 
-  let set_running_output_cache cache name ser_inp fut =
+  let set_running_output_cache cache name ser_inp id fut =
     let rinfo = {
-      state = Running fut
+      state = Running fut;
+      id = id;
     } in
     update_cache cache name ser_inp rinfo;
     Fiber.return fut
 
-  let update_caches cache name ser_inp out_spec (res, deps) =
+  let update_caches cache name ser_inp out_spec id (res, deps) =
     let rinfo = {
       state = Done res;
+      id = id;
     } in
     update_cache cache name ser_inp rinfo;
     let goinfo = {
@@ -201,24 +253,24 @@ module Memoize = struct
 
   let memoization (cache : 'b t) (name : name) (in_spec : 'a input_spec) (out_spec : 'b output_spec) (comp : 'a -> 'b Fiber.t) : ('a -> 'b Fiber.t) =
     (* the computation that force computes the fiber *)
-    let recompute inp ser_inp comp =
+    let recompute inp ser_inp id comp =
       (* create an ivar so other threads can wait for the computation to finish *)
       let ivar : 'b Fiber.Ivar.t = Fiber.Ivar.create () in
       (* create an output cache entry with our ivar *)
-      set_running_output_cache cache name ser_inp ivar
+      set_running_output_cache cache name ser_inp id ivar
       (* set context of computation then run it *)
-      >>= (fun _ -> comp inp |> wrap_fiber (name, ser_inp))
+      >>= (fun _ -> comp inp |> wrap_fiber (name, ser_inp) id)
       (* update the output cache with the correct value *)
-      >>= update_caches cache name ser_inp out_spec  
+      >>= update_caches cache name ser_inp out_spec id
       (* fill the ivar for any waiting threads *)
       >>= (fun res -> Fiber.Ivar.fill ivar res >>= fun _ -> Fiber.return res) in
 
     (* the function has already been calculated, determine if
        any inputs have been updated otherwise return the cached
        value *)
-    let cached_computation inp ser_inp rinfo res =
-      if dependencies_updated rinfo then
-        recompute inp ser_inp comp
+    let cached_computation inp ser_inp id ginfo res =
+      if dependencies_updated ginfo then
+        recompute inp ser_inp id comp
       else
         Fiber.return res in
 
@@ -226,21 +278,22 @@ module Memoize = struct
     let caching_computation inp ser_inp rinfo =
       match rinfo.state with
       | Running fut ->
-        find_cycle name ser_inp inp
+        find_cycle rinfo.id inp
         >>= (fun _ -> Fiber.Ivar.read fut)
         (* >>| (fun _ -> last_output_cache_exn cache name ser_inp)
         >>= (fun rinfo -> caching_computation inp ser_inp rinfo) *)
       | Done res ->
-        let rinfo = last_global_cache_exn name ser_inp in
-        cached_computation inp ser_inp rinfo res in
+        let ginfo = last_global_cache_exn name ser_inp in
+        cached_computation inp ser_inp rinfo.id ginfo res in
 
     (* determine if there is an output cache entry *)
     (fun inp ->
       let ser_inp = in_spec.serialize inp in
       Fiber.return inp
+      >>= add_dep name ser_inp
       >>| (fun _ -> last_output_cache cache name ser_inp)
       >>= (function
-           | None -> recompute inp ser_inp comp 
+           | None -> recompute inp ser_inp (Id.gen ()) comp
            | Some rinfo -> caching_computation inp ser_inp rinfo)
     )
 end

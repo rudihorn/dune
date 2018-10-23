@@ -51,9 +51,6 @@ module Memoize : sig
 
   val get_deps : name -> ser_input -> (name * ser_input) list option
 
-  (* add a dependency to the current fiber context *)
-  val add_dep : name -> ser_input -> 'a -> 'a Fiber.t
-
   val dump_stack : 'a -> 'a Fiber.t
 
   val get_call_stack : (name * ser_input) list Fiber.t

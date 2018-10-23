@@ -88,6 +88,8 @@ let eager_function_output_spec = {
   default_compare = Recompute;
 }
 
+type update_cache = unit -> ser_output Fiber.t
+
 type 'output run_state =
   | Running of 'output Fiber.Ivar.t
   | Done of 'output
@@ -95,7 +97,7 @@ type 'output run_state =
 type global_cache_info = {
   last_output : ser_output;
   default_compare : compare_policy;
-  last_deps : (name * ser_input * ser_output) list;
+  last_deps : (name * ser_input * update_cache) list;
 }
 
 let global_cache_table : (name * ser_input, global_cache_info) Hashtbl.t = Hashtbl.create 256
@@ -184,8 +186,8 @@ module Memoize = struct
                die "Cycle detected:")
       >>| (fun _ -> v)
 
-  let add_dep (dep : string) (inp : ser_input) x =
-    Fiber.Var.get dep_key >>= (fun deps -> Option.iter deps ~f:(fun deps -> deps := (dep,inp) :: !deps); (Fiber.return x))
+  let add_dep (dep : string) (inp : ser_input) (update : update_cache) x =
+    Fiber.Var.get dep_key >>= (fun deps -> Option.iter deps ~f:(fun deps -> deps := (dep,inp,update) :: !deps); (Fiber.return x))
 
   let last_global_cache (name : name) (inp : ser_input) =
     Hashtbl.find global_cache_table (name, inp)
@@ -207,22 +209,26 @@ module Memoize = struct
 
   let get_deps (name : name) (inp : ser_input) =
     let c = last_global_cache name inp in
-    Option.map ~f:(fun r -> r.last_deps |> List.map ~f:(fun (n,i,_o) -> n,i)) c
+    Option.map ~f:(fun r -> r.last_deps |> List.map ~f:(fun (n,i,_u) -> n,i)) c
 
   let dependencies_updated rinfo =
-    List.exists ~f:(fun (dep, inp, outp) ->
-      let last_res = last_global_cache dep inp in
-      let not_equal =
-        Option.map ~f:(fun res ->
-          match res.default_compare with
-          | Recompute -> true
-          | Output -> outp <> res.last_output
-        ) last_res in
-      Option.value ~default:true not_equal
-    ) rinfo.last_deps
-
-  let last_global_output_exn (name : name) (inp : ser_input) =
-    last_global_cache_exn name inp |> (fun r -> r.last_output)
+    rinfo.last_deps |> Fiber.parallel_map ~f:(fun (dep, inp, upd) ->
+      (* rerun the computation to transitively check / update dependencies *)
+      upd ()
+      (* compare with last used output *)
+      >>| (fun outp -> 
+        let last_res = last_global_cache dep inp in
+        let not_equal =
+          Option.map ~f:(fun res ->
+            match res.default_compare with
+            | Recompute -> true
+            | Output -> outp <> res.last_output
+          ) last_res in
+        Option.value ~default:true not_equal
+      )
+    )
+    (* if any of the dependencies has changed we need to update *)
+    >>| (fun dat -> dat |> List.exists ~f:(fun b -> b))
 
   let create_cache () =
     {
@@ -244,22 +250,24 @@ module Memoize = struct
     } in
     update_cache cache name ser_inp rinfo;
     let goinfo = {
-      last_deps = List.map ~f:(fun (d,i) -> d, i, last_global_output_exn d i) deps;
+      last_deps = deps |> List.map ~f:(fun (d,i,u) -> d, i, u);
       last_output = out_spec.serialize res;
       default_compare = out_spec.default_compare;
     } in
     update_global_cache name ser_inp goinfo;
     Fiber.return res
 
-  let memoization (cache : 'b t) (name : name) (in_spec : 'a input_spec) (out_spec : 'b output_spec) (comp : 'a -> 'b Fiber.t) : ('a -> 'b Fiber.t) =
+  let rec memoization (cache : 'b t) (name : name) (in_spec : 'a input_spec) (out_spec : 'b output_spec) (comp : 'a -> 'b Fiber.t) : ('a -> 'b Fiber.t) =
     (* the computation that force computes the fiber *)
     let recompute inp ser_inp id comp =
       (* create an ivar so other threads can wait for the computation to finish *)
       let ivar : 'b Fiber.Ivar.t = Fiber.Ivar.create () in
       (* create an output cache entry with our ivar *)
       set_running_output_cache cache name ser_inp id ivar
+      (* define the function to update / double check intermediate result *)
       (* set context of computation then run it *)
-      >>= (fun _ -> comp inp |> wrap_fiber (name, ser_inp) id)
+      >>= (fun _ ->
+        comp inp |> wrap_fiber (name, ser_inp) id)
       (* update the output cache with the correct value *)
       >>= update_caches cache name ser_inp out_spec id
       (* fill the ivar for any waiting threads *)
@@ -269,10 +277,13 @@ module Memoize = struct
        any inputs have been updated otherwise return the cached
        value *)
     let cached_computation inp ser_inp id ginfo res =
-      if dependencies_updated ginfo then
-        recompute inp ser_inp id comp
-      else
-        Fiber.return res in
+      dependencies_updated ginfo
+      >>= (fun updated ->
+        if updated then
+          recompute inp ser_inp id comp
+        else
+          Fiber.return res
+      ) in
 
     (* determine if the function is still executing *)
     let caching_computation inp ser_inp rinfo =
@@ -289,32 +300,12 @@ module Memoize = struct
     (* determine if there is an output cache entry *)
     (fun inp ->
       let ser_inp = in_spec.serialize inp in
+      let updatefn = inp |> memoization cache name in_spec out_spec comp |> (fun a () -> a >>| out_spec.serialize) in
       Fiber.return inp
-      >>= add_dep name ser_inp
+      >>= add_dep name ser_inp updatefn
       >>| (fun _ -> last_output_cache cache name ser_inp)
       >>= (function
            | None -> recompute inp ser_inp (Id.gen ()) comp
            | Some rinfo -> caching_computation inp ser_inp rinfo)
     )
 end
-
-(*
-let _ = Path.set_root (Path.External.cwd ())
-let _ = Path.set_build_dir (Path.Kind.of_string "_build")
-
-let file_tree = Path.of_string "/home/rhorn/Documents/functors" |> File_tree.load 
-
-let _ = Format.printf "%s" (show File_tree.pp file_tree)
-
-(* let file_tree = File_tree.load Path.root
-
-let _ = Path.External.of_string "/home/rhorn/Documents/functors" |> Path.set_root *)
-
-let stp = Main.setup () |> Fiber.run
-
-
-let conf = Dune_load.load ()
-
-let _gr = Gen_rules.gen ~contexts:stp.contexts ~build_system:stp.build_system conf
-
-*)

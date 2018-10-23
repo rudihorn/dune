@@ -100,7 +100,7 @@
            (diff? %{t} %{t}.corrected)))))
 
 (alias
- (name runteststr)
+ (name runtest)
  (deps (:t string.mlt)
   (glob_files %{project_root}/src/.dune.objs/*.cmi)
   (glob_files %{project_root}/src/stdune/.stdune.objs/*.cmi))
@@ -119,3 +119,6 @@
           (progn
            (run %{exe:expect_test.exe} %{t})
            (diff? %{t} %{t}.corrected)))))
+(alias
+ (name runtest)
+ (deps (alias runtestmem)))

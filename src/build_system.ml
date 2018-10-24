@@ -37,37 +37,6 @@ end
 let files_in_source_tree_to_delete () =
   Promoted_to_delete.load ()
 
-module Exec_status = struct
-  type rule_evaluation = (Action.t * Deps.t) Fiber.Future.t
-  type rule_execution = unit Fiber.Future.t
-
-  type eval_rule = unit -> (Action.t * Deps.t) Fiber.t
-  type exec_rule = rule_evaluation -> unit Fiber.t
-
-  module Evaluating_rule = struct
-    type t =
-      { rule_evaluation : rule_evaluation
-      ; exec_rule       : exec_rule
-      }
-  end
-  module Running = struct
-    type t =
-      { rule_evaluation : rule_evaluation
-      ; rule_execution  : rule_execution
-      }
-  end
-  module Not_started = struct
-    type t =
-      { eval_rule : eval_rule
-      ; exec_rule : exec_rule
-      }
-  end
-  type t =
-    | Not_started     of Not_started.t
-    | Evaluating_rule of Evaluating_rule.t
-    | Running         of Running.t
-end
-
 let rule_loc ~file_tree ~loc ~dir =
   match loc with
   | Some loc -> loc
@@ -117,7 +86,6 @@ module Internal_rule = struct
     ; mode             : Dune_file.Rule.Mode.t
     ; loc              : Loc.t option
     ; dir              : Path.t
-    ; mutable exec     : Exec_status.t
     ; start_rule       : unit -> unit (* legacy for hooks *)
     ; run_rule         : Action.t -> Deps.t -> unit Fiber.t (* the actual computation *)
     ; (* Reverse dependencies discovered so far, labelled by the
@@ -149,47 +117,11 @@ module Internal_rule = struct
     ; mode        = Standard
     ; loc         = None
     ; dir         = Path.root
-    ; exec        = Not_started { eval_rule = (fun _ -> assert false)
-                                ; exec_rule = (fun _ -> assert false)
-                                }
     ; start_rule  = ignore
     ; run_rule    = (fun _ _ -> Fiber.return ())
     ; rev_deps    = []
     ; transitive_rev_deps = Id.Set.empty
     }
-
-  let dependency_cycle ~last ~last_rev_dep ~last_requested_file =
-    let rec build_loop acc t =
-      if t.id = last.id then
-        last_requested_file :: acc
-      else
-        let requested_file, rev_dep =
-          List.find_exn
-            t.rev_deps
-            ~f:(fun (_, t) -> Id.Set.mem t.transitive_rev_deps last.id)
-        in
-        build_loop (requested_file :: acc) rev_dep
-    in
-    let loop = build_loop [last_requested_file] last_rev_dep in
-    die "Dependency cycle between the following files:\n    %s"
-      (String.concat ~sep:"\n--> "
-         (List.map loop ~f:Path.to_string))
-
-  let dep_path_var = Fiber.Var.create ()
-
-  let push_rev_dep t requested_file ~f =
-    Fiber.Var.get dep_path_var >>= fun x ->
-    let rev_dep = Option.value x ~default:root in
-    if Id.Set.mem rev_dep.transitive_rev_deps t.id then
-      dependency_cycle ~last:t ~last_rev_dep:rev_dep
-        ~last_requested_file:requested_file;
-    t.rev_deps <- (requested_file, rev_dep) :: t.rev_deps;
-    t.transitive_rev_deps <-
-      Id.Set.union t.transitive_rev_deps rev_dep.transitive_rev_deps;
-    let on_error exn =
-      Dep_path.reraise exn (Path requested_file)
-    in
-    Fiber.Var.set dep_path_var t (Fiber.with_error_handler f ~on_error)
 end
 
 module File_kind = struct
@@ -454,8 +386,9 @@ type t =
     packages : Package.Name.t Path.Table.t
   ; load_dir_cache : Path.Set.t Memoize.t
   (* memoized functions *)
-  ; build_generic_rule_def : (Static_deps.t * Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) CRef.comp
-  ; build_file_def : (Path.t, unit) CRef.comp
+  ; build_generic_rule_def : (bool * Static_deps.t * Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) CRef.comp
+  ; build_file_def : (bool * bool * Path.t, unit) CRef.comp
+  ; build_internal_rule_def : (bool * bool * Internal_rule.t, unit) CRef.comp
   }
 
 let string_of_paths set =
@@ -755,12 +688,6 @@ let no_rule_found =
           ctx
           (hint ctx (String.Map.keys t.contexts))
 
-let parallel_iter_paths paths ~f =
-  Fiber.parallel_iter (Path.Set.to_list paths) ~f
-
-let parallel_iter_deps deps ~f =
-  parallel_iter_paths (Deps.paths deps) ~f
-
 let rec compile_rule t ?(copy_source=false) pre_rule =
   let { Pre_rule.
         context
@@ -842,7 +769,6 @@ let rec compile_rule t ?(copy_source=false) pre_rule =
           | None ->
             action
         in
-        make_local_dirs t (Action.chdirs action);
         with_locks locks ~f:(fun () ->
           Action_exec.exec ~context ~targets action) >>| fun () ->
         Option.iter sandbox_dir ~f:Path.rm_rf;
@@ -873,28 +799,6 @@ let rec compile_rule t ?(copy_source=false) pre_rule =
     end;
     t.hook Rule_completed
   in
-  let eval_rule () =
-    t.hook Rule_started;
-    let static_deps = Lazy.force static_deps in
-    wait_for_deps t (Static_deps.rule_deps static_deps) ~loc
-    >>| fun () ->
-    Build_exec.exec t build ()
-  in
-  let exec_rule (rule_evaluation : Exec_status.rule_evaluation) =
-    let static_deps = Lazy.force static_deps in
-    let static_deps = Static_deps.action_deps static_deps in
-    Fiber.fork_and_join_unit
-      (fun () ->
-         wait_for_deps ~loc t static_deps)
-      (fun () ->
-         Fiber.Future.wait rule_evaluation >>= fun (action, dyn_deps) ->
-         wait_for_path_deps ~loc t (Deps.path_diff dyn_deps static_deps)
-         >>| fun () ->
-         (action, dyn_deps))
-    >>= fun (action, dyn_deps) ->
-      let all_deps = Deps.union dyn_deps static_deps in
-      run_rule action all_deps
-  in
   let rule =
     let id = Internal_rule.Id.gen () in
     { Internal_rule.
@@ -903,7 +807,6 @@ let rec compile_rule t ?(copy_source=false) pre_rule =
     ; targets
     ; build
     ; context
-    ; exec = Not_started { eval_rule; exec_rule }
     ; start_rule = start_rule
     ; run_rule = run_rule
     ; mode
@@ -971,75 +874,6 @@ and load_dir_and_get_targets t ~dir =
             assert (Path.equal x dir)));
       Path.Table.replace t.dirs ~key:dir ~data:Failed_to_load;
       reraise exn
-
-(*
-and load_dir_and_get_targets t ~dir =
-  let res = dir |> load_dir_and_get_targets_mem t |> Fiber.run in
-  Path.Set.to_list res |> List.iter ~f:(fun i -> "dep " ^ Path.to_string i |> print_endline);
-  res *)
-  
-and _fallback_collector t ~dir ~(collector : Dir_status.rules_collector) = 
-  let lazy_generators =
-    match collector.stage with
-    | Loading ->
-      die "recursive dependency between directories:\n    %s"
-        (String.concat ~sep:"\n--> "
-            (List.map t.load_dir_stack ~f:Utils.describe_target))
-    | Pending { lazy_generators } ->
-      collector.stage <- Loading;
-      lazy_generators
-  in
-
-  collector.stage <- Loading;
-  t.load_dir_stack <- dir :: t.load_dir_stack;
-
-  try
-    load_dir_step2_exn t ~dir ~collector ~lazy_generators
-  with exn ->
-    print_endline "some_exn";
-    (match Path.Table.find t.dirs dir with
-      | Some (Loaded _) -> ()
-      | _ ->
-        (match t.load_dir_stack with
-        | [] -> assert false
-        | x :: l ->
-          t.load_dir_stack <- l;
-          assert (Path.equal x dir)));
-    Path.Table.replace t.dirs ~key:dir ~data:Failed_to_load;
-    reraise exn 
-
-and _compute_dir t dir = 
-  "test " ^ Path.to_string dir |> print_endline;
-  let res =
-    if Path.is_in_source_tree dir then
-      File_tree.files_of t.file_tree dir |> Fiber.return
-    else if Path.equal dir Path.build_dir then
-      (* Not allowed to look here *)
-      Path.Set.empty |> Fiber.return
-    else if not (Path.is_managed dir) then
-      (match Path.readdir_unsorted dir with
-      | exception _ -> Path.Set.empty
-      | files ->
-        Path.Set.of_list (List.map files ~f:(Path.relative dir))) |> Fiber.return
-    else begin
-      let (ctx, sub_dir) = Option.value_exn (Path.extract_build_context dir) in
-      if ctx = ".aliases" then
-        Path.(append build_dir) sub_dir |> _load_dir_and_get_targets_mem t 
-      else if ctx <> "install" && not (String.Map.mem t.contexts ctx) then
-        Path.Set.empty |> Fiber.return
-      else
-        let collector : Dir_status.rules_collector = 
-          { rules   = []
-          ; aliases = String.Map.empty
-          ; stage   = Pending { lazy_generators = [] }
-          } in
-        _fallback_collector t ~dir:dir ~collector:collector |> Fiber.return
-      end in
-  res
-
-and _load_dir_and_get_targets_mem t =
-  let comp = fun v -> "call " ^ Path.to_string v |> print_endline; Fiber.return v >>= (_compute_dir t) in
-  Memoize.memoization t.load_dir_cache "load_dir_and_get_targets" path_input_spec eager_function_output_spec comp
 
 and load_dir_step2_exn t ~dir ~collector ~lazy_generators =
   List.iter lazy_generators ~f:(fun f -> f ());
@@ -1244,25 +1078,21 @@ The following targets are not:
 
   targets
 
-and wait_for_file t ~loc fn =
+let get_file_spec_other t fn =
+  let dir = Path.parent_exn fn in
+  if Path.is_in_build_dir dir then
+    load_dir t ~dir;
   match Path.Table.find t.files fn with
-  | Some file -> wait_for_file_found fn file
+  | Some file ->
+    Fiber.return (Some file)
   | None ->
-    let dir = Path.parent_exn fn in
-    if Path.is_strict_descendant_of_build_dir dir then begin
-      load_dir t ~dir;
-      match Path.Table.find t.files fn with
-      | Some file -> wait_for_file_found fn file
-      | None -> no_rule_found t ~loc fn
-    end else if Path.exists fn then
-      Fiber.return ()
-    else
-      die "File unavailable: %s" (Path.to_string_maybe_quoted fn)
+    Fiber.return None
+
 
 and get_file_spec t ~loc path =
   match Path.Table.find t.files path with
   | Some file -> Some file |> Fiber.return 
-  | None ->
+  | None -> 
     let dir = Path.parent_exn path in
     if Path.is_strict_descendant_of_build_dir dir then begin
       load_dir t ~dir;
@@ -1273,36 +1103,6 @@ and get_file_spec t ~loc path =
       Fiber.return None
     else
       die "File unavailable: %s" (Path.to_string_maybe_quoted path)
-
-and wait_for_file_found fn (File_spec.T file) =
-  Internal_rule.push_rev_dep file.rule fn ~f:(fun () ->
-    match file.rule.exec with
-    | Not_started { eval_rule; exec_rule } ->
-      Fiber.fork eval_rule
-      >>= fun rule_evaluation ->
-      Fiber.fork (fun () -> exec_rule rule_evaluation)
-      >>= fun rule_execution ->
-      file.rule.exec <-
-        Running { rule_evaluation
-                ; rule_execution
-                };
-      Fiber.Future.wait rule_execution
-    | Running { rule_execution; _ } ->
-      Fiber.Future.wait rule_execution
-    | Evaluating_rule { rule_evaluation; exec_rule } ->
-      Fiber.fork (fun () -> exec_rule rule_evaluation)
-      >>= fun rule_execution ->
-      file.rule.exec <-
-        Running { rule_evaluation
-                ; rule_execution
-                };
-      Fiber.Future.wait rule_execution)
-
-and wait_for_path_deps ~loc t paths =
-  parallel_iter_paths paths ~f:(wait_for_file ~loc t)
-
-and wait_for_deps ~loc t deps =
-  wait_for_path_deps ~loc t (Deps.paths deps)
 
 let stamp_file_for_files_of t ~dir ~ext =
   let files_of_dir =
@@ -1354,26 +1154,6 @@ let finalize t =
   Utils.Cached_digest.dump ();
   Trace.dump t.trace
 
-let eval_request t ~request ~process_target =
-  let static_deps =
-    Build_interpret.static_deps
-      request
-      ~all_targets:(targets_of t)
-      ~file_tree:t.file_tree
-  in
-  let rule_deps = Static_deps.rule_deps static_deps in
-  let static_deps = Static_deps.action_deps static_deps in
-
-  Fiber.fork_and_join_unit
-    (fun () -> parallel_iter_deps ~f:process_target static_deps)
-    (fun () ->
-       wait_for_deps t ~loc:None rule_deps
-       >>= fun () ->
-       let result, dyn_deps = Build_exec.exec t request () in
-       parallel_iter_paths ~f:process_target (Deps.path_diff dyn_deps static_deps)
-       >>| fun () ->
-       result)
-
 let universe_file = Path.relative Path.build_dir ".universe-state"
 
 let update_universe t =
@@ -1396,57 +1176,92 @@ let parallel_iter_deps deps ~f =
   Deps.paths deps |> parallel_iter_path_set ~f 
 
 (* val build_generic_rule t : bs -> Static_deps.t * Internal_rule.t * ('a, 'b) Build.t ->  *)
-let build_generic_rule t (static_deps, rule, build : Static_deps.t * Internal_rule.t * ('a, 'b) Build.t) =
+let build_generic_rule t (static_only, static_deps, rule, build : bool * Static_deps.t * Internal_rule.t * ('a, 'b) Build.t) =
   let rule_deps = Static_deps.rule_deps static_deps in
   let action_deps = Static_deps.action_deps static_deps in
 
-  let comp_file file =
-    file |> CRef.get t.build_file_def in
+  let comp_file static file =
+    (static, static_only, file) |> CRef.get t.build_file_def in
 
   Fiber.fork (fun () ->
     rule.start_rule (); (* legacy for hooks *)
     (* first compute rule dependencies*)
-    parallel_iter_deps rule_deps ~f:comp_file
+    parallel_iter_deps rule_deps ~f:(comp_file true)
     (* then execute the build *)
     >>| Build_exec.exec t build
   )
   >>= (fun rule_eval ->
     (* now compute the action dependencies *)
-    Fiber.fork (fun () -> parallel_iter_deps action_deps ~f:comp_file)
+    Fiber.fork (fun () -> parallel_iter_deps action_deps ~f:(comp_file false))
     (* wait for action dependencies *)
     >>= Fiber.Future.wait
     (* wait for rule dependencies *)
     >>> Fiber.Future.wait rule_eval
     (* wait for dynamic dependencies *)
     >>= fun (action, dyn_deps) ->
-      Deps.path_diff dyn_deps rule_deps |> parallel_iter_path_set ~f:comp_file
+      Deps.path_diff dyn_deps rule_deps |> parallel_iter_path_set
+        ~f:(comp_file false)
     >>> Fiber.return (action, Deps.union rule_deps dyn_deps)
   )
 
-let build_file t path =
+let build_internal_rule t (static, static_only, rule : bool * bool * Internal_rule.t) = 
+  let static_deps = Lazy.force rule.static_deps in
+  (static_only, static_deps, rule, rule.build)|> CRef.get t.build_generic_rule_def
+  >>= (fun (action, all_deps) ->
+      if static_only && not static then Fiber.return () else rule.run_rule action all_deps)
+
+let build_file t (static, static_only, path) =
   let build_file_spec (File_spec.T file) =
-    let static_deps = Lazy.force file.rule.static_deps in
-    (static_deps, file.rule, file.rule.build) |> CRef.get t.build_generic_rule_def
-    >>= (fun (action, all_deps) ->
-      file.rule.run_rule action all_deps) in 
+    (static, static_only, file.rule) |> CRef.get t.build_internal_rule_def in 
   get_file_spec t ~loc:None path 
   >>= (function
       | None -> (* file already exists *) Fiber.return ()
       | Some file -> (* build *) build_file_spec file >>| ignore)
 
-let build_request t ~request =
+let build_request t static_only ~request =
   let static_deps =
     Build_interpret.static_deps
       request
       ~all_targets:(targets_of t)
       ~file_tree:t.file_tree in
-  (static_deps, Internal_rule.root, request)
+  (static_only, static_deps, Internal_rule.root, request)
   |> build_generic_rule t
-  >>| (fun (res,_) -> res)
 
 let do_build (t : t) ~request =
   update_universe t; (* ? *)
-  build_request t ~request:request
+  build_request t false ~request:request |> Memoize.run_memoize
+  >>| (fun (res,_) -> res)
+
+let file_cache = Memoize.create_cache ()
+let path_to_string (a,b,c) =
+  (Printf.sprintf "%s %s %s" (Path.to_string c) (string_of_bool a) (string_of_bool b))
+let path_compare a b = a <> b
+let path_input_spec = {
+  Memoization.
+  serialize = path_to_string;
+  print = path_to_string;
+  not_equal = path_compare;
+}
+
+let rule_id_string (b1, b2, r : bool * bool * Internal_rule.t) =
+  Printf.sprintf "%s %s %s"
+    (Internal_rule.Id.to_int r.id |> string_of_int)
+    (string_of_bool b1) (string_of_bool b2)
+let rule_input_spec = {
+  Memoization.
+  serialize = rule_id_string; 
+  print = rule_id_string;
+  not_equal = (fun r1 r2 -> r1 <> r2);
+}
+
+
+let empty_string () = "" 
+let unit_output_spec = {
+  Memoization.
+  serialize = empty_string;
+  print = empty_string;
+  cutoff_policy = Cutoff;
+}
 
 let create ~contexts ~file_tree ~hook =
   Utils.Cached_digest.load ();
@@ -1472,19 +1287,16 @@ let create ~contexts ~file_tree ~hook =
     ; load_dir_cache = Memoize.create_cache ()
     ; build_generic_rule_def = CRef.deferred ()
     ; build_file_def = CRef.deferred ()
+    ; build_internal_rule_def = CRef.deferred ()
     }
   in
   CRef.set t.build_generic_rule_def (build_generic_rule t);
-  CRef.set t.build_file_def (build_file t);
+  Memoize.memoization file_cache "build_file" path_input_spec unit_output_spec (build_file t)
+    |> CRef.set t.build_file_def;
+  Memoize.memoization file_cache "build_internal_rule" rule_input_spec unit_output_spec (build_internal_rule t)
+    |> CRef.set t.build_internal_rule_def;
   Hooks.End_of_build.once (fun () -> finalize t);
   t
-
-(*
-let do_build t ~request =
-  entry_point t ~f:(fun () ->
-    update_universe t;
-    eval_request t ~request ~process_target:(wait_for_file ~loc:None t))
-*)
 
 module Ir_set = Set.Make(Internal_rule)
 
@@ -1579,84 +1391,65 @@ let rules_for_files rules deps =
   |> Rule_set.to_list
 
 let build_rules_internal ?(recursive=false) t ~request =
-  let rules_seen = ref Rule.Id.Set.empty in
   let rules = ref [] in
-  let rec loop fn =
-    let dir = Path.parent_exn fn in
-    if Path.is_in_build_dir dir then
-      load_dir t ~dir;
-    match Path.Table.find t.files fn with
-    | Some file ->
-      file_found fn file
-    | None ->
-      Fiber.return ()
-  and file_found fn (File_spec.T { rule = ir; _ }) =
-    if Rule.Id.Set.mem !rules_seen ir.id then
-      Fiber.return ()
-    else begin
-      rules_seen := Rule.Id.Set.add !rules_seen ir.id;
-      (Internal_rule.push_rev_dep ir fn ~f:(fun () ->
-         match ir.exec with
-         | Running { rule_evaluation; _ }
-         | Evaluating_rule { rule_evaluation; _ } ->
-           Fiber.return rule_evaluation
-         | Not_started { eval_rule; exec_rule } ->
-           Fiber.fork eval_rule
-           >>| fun rule_evaluation ->
-           ir.exec <- Evaluating_rule { rule_evaluation
-                                      ; exec_rule
-                                      };
-           rule_evaluation))
-      >>= fun rule_evaluation ->
-      Fiber.fork (fun () ->
-        Fiber.Future.wait rule_evaluation
-        >>| fun (action, dyn_deps) ->
-        let action_deps =
-          Static_deps.action_deps
-            (Lazy.force ir.static_deps)
-        in
-        { Rule.
-          id      = ir.id
-        ; dir     = ir.dir
-        ; deps    = Deps.union action_deps dyn_deps
-        ; targets = ir.targets
-        ; context = ir.context
-        ; action  = action
-        })
-      >>= fun rule ->
-      rules := rule :: !rules;
-      if not recursive then
-        Fiber.return ()
-      else
-        Fiber.Future.wait rule >>= fun rule ->
-        parallel_iter_deps rule.deps ~f:loop
-    end
-  in
-  let targets = ref Deps.empty in
-  eval_request t ~request ~process_target:(fun fn ->
-    targets := Deps.add_path !targets fn;
-    loop fn)
-  >>= fun () ->
-  Fiber.all (List.map !rules ~f:Fiber.Future.wait)
-  >>| fun rules ->
-  let rules =
-    List.fold_left rules ~init:Path.Map.empty ~f:(fun acc (r : Rule.t) ->
-      Path.Set.fold r.targets ~init:acc ~f:(fun fn acc ->
-        Path.Map.add acc fn r))
-  in
-  match
+  let rec run_rule (rule : Internal_rule.t) =
+    let static_deps = Lazy.force rule.static_deps in
+    (true, static_deps, rule, rule.build) |> CRef.get t.build_generic_rule_def
+    >>= (fun (action,deps) ->
+      let rule = {
+         Rule.
+         id = rule.id;
+         dir = rule.dir;
+         deps = deps;
+         targets = rule.targets;
+         context = rule.context;
+         action = action;
+       } in
+       rules := rule :: !rules;
+       if recursive then
+         parallel_iter_deps deps ~f:proc_rule
+       else
+         Fiber.return ()
+    )
+  and proc_rule dep =
+    get_file_spec_other t dep 
+    >>= (fun fs ->
+      Option.value_exn fs |> fun (File_spec.T file) ->
+       let rule = file.rule in
+       run_rule rule)
+    >>=
+    Fiber.return in
+  build_request t true ~request
+  >>= (fun (_, deps) ->
+    parallel_iter_deps deps ~f:proc_rule
+    >>> Fiber.return deps)
+  >>| (fun deps ->
+    let targets = Build_interpret.static_deps
+      request
+      ~all_targets:(targets_of t)
+      ~file_tree:t.file_tree
+    |> Static_deps.rule_deps 
+    |> Deps.path_diff deps
+    |> Deps.add_paths Deps.empty in
+    let rules = !rules in
+    let rules =
+        List.fold_left rules ~init:Path.Map.empty ~f:(fun acc (r : Rule.t) ->
+          Path.Set.fold r.targets ~init:acc ~f:(fun fn acc ->
+            Path.Map.add acc fn r)) in
+    match 
     Rule.Id.Top_closure.top_closure
-      (rules_for_files rules !targets)
+      (rules_for_files rules targets)
       ~key:(fun (r : Rule.t) -> r.id)
       ~deps:(fun (r : Rule.t) ->
         rules_for_files rules r.deps)
-  with
-  | Ok l -> l
-  | Error cycle ->
-    die "dependency cycle detected:\n   %s"
-      (List.map cycle ~f:(fun rule ->
-         Path.to_string (Option.value_exn (Path.Set.choose rule.Rule.targets)))
-       |> String.concat ~sep:"\n-> ")
+    with
+    | Ok l -> l
+    | Error cycle ->
+      die "dependency cycle detected:\n   %s"
+        (List.map cycle ~f:(fun rule ->
+          Path.to_string (Option.value_exn (Path.Set.choose rule.Rule.targets)))
+        |> String.concat ~sep:"\n-> ")
+  )
 
 let build_rules ?recursive t ~request =
   entry_point t ~f:(fun () ->
@@ -1668,13 +1461,15 @@ let set_package t file package =
 let package_deps t pkg files =
   let rules_seen = ref Rule.Id.Set.empty in
   let rec loop fn acc =
-    match Path.Table.find_all t.packages fn with
-    | [] -> loop_deps fn acc
-    | pkgs ->
-      if List.mem pkg ~set:pkgs then
-        loop_deps fn acc
-      else
-        List.fold_left pkgs ~init:acc ~f:add_package
+    acc >>= (fun acc -> 
+      match Path.Table.find_all t.packages fn with
+      | [] -> loop_deps fn acc
+      | pkgs ->
+        if List.mem pkg ~set:pkgs then
+          loop_deps fn acc
+        else
+          List.fold_left pkgs ~init:acc ~f:add_package |> Fiber.return
+    )
   and add_package acc p =
     let open Package.Name.Infix in
     if p = pkg then
@@ -1683,33 +1478,27 @@ let package_deps t pkg files =
       Package.Name.Set.add acc p
   and loop_deps fn acc =
     match Path.Table.find t.files fn with
-    | None -> acc
+    | None -> Fiber.return acc
     | Some (File_spec.T { rule = ir; _ }) ->
       if Rule.Id.Set.mem !rules_seen ir.id then
-        acc
+        Fiber.return acc
       else begin
         rules_seen := Rule.Id.Set.add !rules_seen ir.id;
-        let _, dyn_deps =
-          match ir.exec with
-          | Running { rule_evaluation; _ }
-          | Evaluating_rule { rule_evaluation; _ } ->
-            Option.value_exn (Fiber.Future.peek rule_evaluation)
-          | Not_started _ -> assert false
-        in
-        let action_deps =
-          Static_deps.action_deps
-            (Lazy.force ir.static_deps)
-        in
-        Path.Set.fold
-          (Deps.path_union action_deps dyn_deps)
-          ~init:acc ~f:loop
+        let static_deps = Lazy.force ir.static_deps in
+        let rule_deps = Static_deps.rule_deps static_deps in
+        (true, static_deps, ir, ir.build) |> CRef.get t.build_generic_rule_def 
+        >>= (fun (_,deps ) ->
+          let dyn_deps = Deps.path_diff deps rule_deps in
+          let action_deps = Static_deps.action_deps static_deps |> Deps.paths in
+          Path.Set.fold (Path.Set.union action_deps dyn_deps) ~init:(acc |> Fiber.return) ~f:loop)
       end
   in
   let open Build.O in
   Build.paths_for_rule files >>^ fun () ->
   (* We know that at this point of execution, all the relevant ivars
      have been filled *)
-  Path.Set.fold files ~init:Package.Name.Set.empty ~f:loop_deps
+  Path.Set.fold files ~init:Package.Name.Set.empty
+    ~f:(fun f acc -> loop_deps f acc |> Memoize.run_memoize |> Fiber.run)
 
 (* +-----------------------------------------------------------------+
    | Adding rules to the system                                      |

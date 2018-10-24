@@ -10,7 +10,7 @@ Fiber.return 5;;
 |}]
 
 (* to run a computation *)
-let runstr f v = f v |> Fiber.run;;
+let run f v = f v |> Memoize.run_memoize |> Fiber.run;;
 
 (* the trivial dependencies are simply the identity function *)
 let compdep x = Fiber.return (x ^ x);;
@@ -23,11 +23,11 @@ let mcompdep2 = memoization memcache "another" string_input_spec string_output_s
 
 (* compute the dependencies once so they are present in the
    global hash table *)
-runstr mcompdep1 "a";;
-runstr mcompdep2 "a";;
+run mcompdep1 "a";;
+run mcompdep2 "a";;
 
 [%%expect{|
-val runstr : ('a -> 'b Fiber.t) -> 'a -> 'b = <fun>
+val run : ('a -> 'b Fiber.t) -> 'a -> 'b = <fun>
 val compdep : string -> string Fiber.t = <fun>
 val memcache : '_weak1 t = <abstr>
 val mcompdep1 : string -> string Fiber.t = <fun>
@@ -61,9 +61,9 @@ val mcomp : string -> string Fiber.t = <fun>
    running it again should not, but should still return the
    same result *)
 !counter;;
-runstr mcomp "a";; 
+run mcomp "a";; 
 !counter;;
-runstr mcomp "a";; 
+run mcomp "a";; 
 !counter;;
 
 [%%expect{|
@@ -82,9 +82,9 @@ get_deps "test" "a";;
 
 (* running it on a new input should cause it to recompute
    the first time it is run *)
-runstr mcomp "hello";; 
+run mcomp "hello";; 
 !counter;;
-runstr mcomp "hello";; 
+run mcomp "hello";; 
 !counter;;
 
 [%%expect{|
@@ -95,10 +95,10 @@ runstr mcomp "hello";;
 |}]
 
 (* updating the first dependency should require recomputation of mcomp 7 *)
-runstr mcompdep1 "testtest";;
-runstr mcomp "hello";;
+run mcompdep1 "testtest";;
+run mcomp "hello";;
 !counter;;
-runstr mcomp "hello";;
+run mcomp "hello";;
 !counter;;
 
 [%%expect{|
@@ -138,7 +138,7 @@ val mcompcycle : (int, string) CRef.t = <fun>
 |}]
 
 counter := 0;
-mcompcycle 5 |> Fiber.run;;
+run mcompcycle 5;;
 !counter;;
 !stack;;
 
@@ -147,8 +147,9 @@ Exception: Never.
 Raised at file "src/fiber/fiber.ml", line 428, characters 20-25
 Called from file "toplevel/toploop.ml", line 180, characters 17-56
 - : int = 4
-- : (string * string) list =
-[("cycle", "2"); ("cycle", "1"); ("cycle", "0"); ("cycle", "5")]
+- : stack_frame list =
+[{name = "cycle"; input = "2"}; {name = "cycle"; input = "1"};
+ {name = "cycle"; input = "0"}; {name = "cycle"; input = "5"}]
 |}]
 
 let iimemcached = create_cache ();;
@@ -169,12 +170,14 @@ let mfib =
   CRef.get mfib;;
 
 counter := 0;
-mfib 2000 |> Fiber.run;;
+run mfib 2000;;
 !counter;;
+run mfib 1800;;
 
 [%%expect{|
 val iimemcached : '_weak4 t = <abstr>
 val mfib : (int, int) CRef.t = <fun>
 - : int = 2406280077793834213
 - : int = 2001
+- : int = 3080005411477819488
 |}]

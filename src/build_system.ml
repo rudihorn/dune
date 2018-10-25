@@ -1208,7 +1208,7 @@ let build_generic_rule t (static_only, static_deps, rule, build : bool * Static_
     >>= fun (action, dyn_deps) ->
       Deps.path_diff dyn_deps rule_deps |> parallel_iter_path_set
         ~f:(comp_file false)
-    >>> Fiber.return (action, Deps.union rule_deps dyn_deps)
+    >>> Fiber.return (action, Deps.union action_deps dyn_deps)
   )
 
 let build_internal_rule t (static, static_only, rule : bool * bool * Internal_rule.t) = 

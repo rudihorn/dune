@@ -47,12 +47,16 @@ module CRef : sig
   val get : ('a, 'b) comp -> ('a, 'b) t
 end
 
+
+type dependency_info
+
 module Memoize : sig
   type 'a t 
 
   type stack_frame = {
     name : name;
     input : ser_input;
+    dep_info : dependency_info;
   }
 
   (** Create a cache used by the memoization for the specific output type.

@@ -24,3 +24,7 @@ the second run of dune.
   --> _build/default/x3
   --> _build/default/x2
   [1]
+
+  $ dune build @complex-repro-case
+  Dependency cycle between the following files:
+  [1]

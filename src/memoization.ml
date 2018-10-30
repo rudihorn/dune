@@ -105,17 +105,17 @@ type global_cache_info = {
 }
 
 module Id = struct
-  include IdGen
+  include Id_gen
 
-  let idgen = IdGen.create ()
-  let gen () = IdGen.gen idgen 
+  let idgen = Id_gen.create ()
+  let gen () = Id_gen.gen idgen
 end
 
 module Index = struct
-  include IdGen
+  include Id_gen
 
-  let idgen = IdGen.create ()
-  let gen () = - (IdGen.gen idgen |> to_int)
+  let idgen = Id_gen.create ()
+  let gen () = - (Id_gen.gen idgen |> to_int)
 end
 
 let global_cache_table : (name * ser_input, global_cache_info) Hashtbl.t = Hashtbl.create 256
@@ -131,6 +131,7 @@ type dependency_info = {
   mutable trans_deps : Id.Set.t;
 }
 
+let global_arc_counter = ref 0
 let global_dep_table : (name * ser_input, dependency_info) Hashtbl.t = Hashtbl.create 256
 
 module CRef = struct
@@ -315,6 +316,13 @@ module Memoize = struct
 
   let add_rev_dep (dep_info : dependency_info) =
     let add (v : dependency_info) (w : dependency_info) = 
+      let n = Hashtbl.length global_dep_table in
+      let m = !global_arc_counter in
+      let delta = min (float m ** (1.0 /. 2.0)) (float n ** (2.0 /. 3.0)) |> (+.) 20.0 |> int_of_float in
+      Printf.printf "m:%d n:%d delta:%d\n%!" m n delta;
+
+      global_arc_counter := m + 1;
+
       (* Printf.printf "new add %s -> %s\n%!" v.input w.input; *)
       let marked_ids = ref Id.Set.empty in
       let arcs = ref 0 in
@@ -322,25 +330,25 @@ module Memoize = struct
       let b = ref [] in
 
       (* A New Approach to Incremental Cycle Detection and Related Problems *)
-      let rec bvisit (y : dependency_info) =
+      let rec bvisit (y : dependency_info) acc =
         marked_ids := Id.Set.union !marked_ids (Id.Set.singleton y.id);
-        if List.exists y.rev_deps ~f:(fun x -> btraverse x y) |> not then begin
+        if List.exists y.rev_deps ~f:(fun x -> btraverse x y (x :: acc)) |> not then begin
           b := List.append !b [y];
           false end
         else
           true
-      and btraverse (x : dependency_info) (_y : dependency_info) =
+      and btraverse (x : dependency_info) (_y : dependency_info) acc =
         if x.id = w.id then
-          die "cycle btraverse";
+          die "cycle btraverse\n   %s" (acc |> List.map ~f:(fun (d : dependency_info) -> d.input) |> String.concat ~sep:"\n   -->");
         arcs := !arcs + 1;
-        if !arcs >= 10 then begin
+        if !arcs >= delta then begin
           w.level <- v.level + 1;
           w.rev_deps <- [];
           b := []; 
           true
         end else begin
           if Id.Set.mem x.id !marked_ids |> not then
-            bvisit x
+            bvisit x acc
           else 
             false
         end in
@@ -360,10 +368,10 @@ module Memoize = struct
           y.rev_deps <- x :: y.rev_deps in
 
       (* step 1: test order *)
-      if (v.level < w.level && v.index < w.index) |> not then
+      if (v.level < w.level || (v.level = w.level && v.index < w.index)) |> not then
       begin
         (* step 2 *)
-        let step2res = bvisit v in
+        let step2res = bvisit v [v; w] in
 
         (* step 3 *)
         if step2res then
@@ -391,27 +399,9 @@ module Memoize = struct
         | [] -> ()
         | x :: _ ->
             let rev_dep = x.dep_info in
-            add rev_dep di
-            (* Printf.printf "  rev dep %s level:%d index:%d\n%!" rev_dep.input rev_dep.level rev_dep.index;
-            Printf.printf "      dep %s level:%d index:%d\n%!" di.input di.level di.index *)
-            (*if Id.Set.mem di.id rev_dep.trans_deps then
-              dependency_cycle_error ~last:di ~rev_dep:rev_dep; *)
-            (* let rec find_cycle (acc : dependency_info list) (dep : dependency_info) =
-              Printf.printf "a";
-              if dep.id = rev_dep.id then
-                Some (dep :: acc)
-              else
-                List.find_map ~f:(dep :: acc |> find_cycle) dep.deps in
-            find_cycle [rev_dep] di |> Option.iter ~f:(fun (err_stack : dependency_info list) ->
-              let inputs = List.map ~f:(fun (st : dependency_info) -> st.input) err_stack in
-              die "A Dependency cycle between the following files:\n    %s"
-                (String.concat ~sep:"\n--> " inputs)
-            ); 
-            rev_dep.deps <- di :: rev_dep.deps; *)
-            (* di.rev_deps <- rev_dep :: di.rev_deps;
-            di.trans_deps <- Id.Set.union di.trans_deps rev_dep.trans_deps *)
-            (* Printf.printf "  upd: %d <- [%s]\n%!" (Id.to_int di.id) (Id.Set.elements di.trans_deps |> List.map ~f:Id.to_int |> List.map ~f:string_of_int |> String.concat ~sep:" ");
-            Printf.printf "  was: %d <- [%s]\n%!" (Id.to_int rd.id) (Id.Set.elements rd.trans_deps |> List.map ~f:Id.to_int |> List.map ~f:string_of_int |> String.concat ~sep:" ") *)
+            (* if the caller doesn't already contain this as a dependent *)
+            if List.exists rev_dep.deps ~f:(fun d -> d.id = di.id) |> not then
+              add rev_dep di
 
   let get_deps (name : name) (inp : ser_input) =
     let c = last_global_cache name inp in

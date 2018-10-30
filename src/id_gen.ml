@@ -11,6 +11,9 @@ let gen counter =
   counter := n + 1;
   n
 
+let peek counter =
+  !counter + 1
+
 module M = struct
   type t = int
   let compare (x : int) y = compare x y

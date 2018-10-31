@@ -90,6 +90,7 @@ let main () =
       [ "src/dune_lang/.dune_lang.objs"
       ; "src/stdune/.stdune.objs"
       ; "src/fiber/.fiber.objs"
+      ; "src/dag/.dag.objs"
       ; "src/.dune.objs"
       ]
       ~f:Topdirs.dir_directory;

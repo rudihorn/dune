@@ -123,6 +123,8 @@ type dep_node = dep_info Dag.node
 
 let global_dep_dag = Dag.create ()
 let global_dep_table : (name * ser_input, dep_node) Hashtbl.t = Hashtbl.create 256
+module Test = struct type t = dep_info list end
+module DepInfoListKind = Dag.Make(Test)
 
 module CRef = struct
   type ('a, 'b) t = 'a -> 'b Fiber.t
@@ -309,8 +311,15 @@ module Memoize = struct
         | x :: _ ->
             let rev_dep = x.dep_node in
             (* if the caller doesn't already contain this as a dependent *)
-            if Dag.is_child rev_dep dep_node |> not then
-              Dag.add rev_dep dep_node
+            try 
+              if Dag.is_child rev_dep dep_node |> not then
+                Dag.add rev_dep dep_node
+            with Dag.Cycle packed ->
+              let cycle =
+                Dag.unpack_list (Dag.dag dep_node) packed
+                |> List.map ~f:(fun (n : dep_node) -> (Dag.get n).input) in
+              die "Dependency cycle between the following files:\n    %s"
+                (String.concat ~sep:"\n--> " cycle)
 
   let get_deps (name : name) (inp : ser_input) =
     let c = last_global_cache name inp in

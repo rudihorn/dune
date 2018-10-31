@@ -2,8 +2,51 @@ open! Stdune
 
 (* A New Approach to Incremental Cycle Detection and Related Problems *)
 
+module Kind = struct 
+  type 'a tag = ..
+
+  module type S = sig
+    type t
+    type 'a tag += X : t tag
+  end
+
+  type 'a t = (module S with type t = 'a)
+
+  let create (type a) () =
+    let module M = struct
+      type t = a
+      type 'a tag += X : t tag
+    end in
+    (module M : S with type t = a)
+
+  let eq (type a) (type b)
+        (module A : S with type t = a)
+        (module B : S with type t = b)
+    : (a, b) Type_eq.t option =
+    match A.X with
+    | B.X -> Some Type_eq.T
+    | _   -> None
+end
+
+module type S = sig
+  type t
+
+  val kind : t Kind.t
+end
+
+module Make
+    (T : sig
+       type t
+     end)
+  : S with type t = T.t =
+struct
+  type t = T.t
+  let kind = Kind.create ()
+end
+
 
 type 'a t = {
+  kind : 'a Kind.t;
   mutable num : int;
   mutable index : int;
   mutable arcs : int;
@@ -19,11 +62,17 @@ type 'a node = {
   mutable rev_deps : 'a node list;
 }
 
-type packed_list = PackedList : _ node list -> packed_list
+type 'a cycle_error = {
+  nodes : 'a node list;
+  kind : 'a Kind.t;
+}
 
-exception Cycle of packed_list
+type packed_cycle_error = PackedList : _ cycle_error -> packed_cycle_error
+
+exception Cycle of packed_cycle_error
 
 let create () = {
+  kind = Kind.create ();
   num = 0;
   index = 0;
   arcs = 0;
@@ -76,7 +125,7 @@ let add v w =
       true
   and btraverse x _y acc =
     if x.id = w.id then
-       Cycle (PackedList acc) |> raise;
+       Cycle (PackedList { nodes = acc; kind = dag.kind }) |> raise;
     arcs := !arcs + 1;
     if !arcs >= delta then begin
       w.level <- v.level + 1;
@@ -90,16 +139,16 @@ let add v w =
         false
     end in
 
-  let rec fvisit x =
-    List.iter x.deps ~f:(fun y -> ftraverse x y);
+  let rec fvisit x acc =
+    List.iter x.deps ~f:(fun y -> ftraverse x y (y :: acc));
     f := x :: !f
-  and ftraverse x y =
+  and ftraverse x y acc =
     if y.id = v.id || List.exists ~f:(fun n -> n.id = y.id) !b then
-      Cycle (PackedList []) |> raise;
+      Cycle (PackedList { nodes = acc; kind = dag.kind }) |> raise;
     if y.level < w.level then begin
       y.level <- w.level;
       y.rev_deps <- [];
-      fvisit y
+      fvisit y acc
     end;
     if y.level = w.level then
       y.rev_deps <- x :: y.rev_deps in
@@ -110,13 +159,14 @@ let add v w =
     (* step 2 *)
     let step2res = bvisit v [v; w] in
 
+    let acc = [w; v] in
     (* step 3 *)
     if step2res then
-      fvisit w
+      fvisit w acc
     else if w.level <> v.level then begin
       w.level <- v.level;
       w.rev_deps <- [];
-      fvisit w
+      fvisit w acc
     end;
 
     (* step 4 *)
@@ -145,3 +195,11 @@ let pp pp_content fmt n =
 
 let is_child v w =
   v.deps |> List.exists ~f:(fun c -> c.id = w.id)
+
+let unpack_list : type a. a t -> packed_cycle_error -> a node list = fun dag v ->
+  match v with
+  | PackedList v ->
+    let Type_eq.T = Kind.eq (v.kind) (dag.kind) |> Option.value_exn in
+    v.nodes
+
+let dag node = node.dag

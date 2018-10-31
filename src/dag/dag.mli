@@ -15,3 +15,7 @@ val get : 'a node -> 'a
 val children : 'a node -> 'a node list
 
 val pp : (Format.formatter -> 'a -> unit) -> Format.formatter -> 'a node -> unit
+
+val delta : 'a t -> int
+
+val is_child : 'a node -> 'a node -> bool

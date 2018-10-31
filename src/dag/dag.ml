@@ -3,8 +3,6 @@ open! Stdune
 (* A New Approach to Incremental Cycle Detection and Related Problems *)
 
 
-module IdSet = Set.Make(Int)
-
 type 'a t = {
   mutable num : int;
   mutable index : int;
@@ -49,14 +47,17 @@ let node dag data =
 
 let get v = v.data
 
+let delta dag =
+  let n = dag.num in
+  let m = dag.arcs in
+  let delta = min (float m ** (1.0 /. 2.0)) (float n ** (2.0 /. 3.0)) |> int_of_float in
+  delta
+
 let add v w =
   assert (v.dag = w.dag);
 
   let dag = v.dag in
-
-  let n = dag.num in
-  let m = dag.arcs in
-  let delta = min (float m ** (1.0 /. 2.0)) (float n ** (2.0 /. 3.0)) |> (+.) 1.0 |> int_of_float in
+  let delta = delta dag in
 
   dag.arcs <- dag.arcs + 1;
 
@@ -112,7 +113,7 @@ let add v w =
     (* step 3 *)
     if step2res then
       fvisit w
-    else if w.level = v.level then begin
+    else if w.level <> v.level then begin
       w.level <- v.level;
       w.rev_deps <- [];
       fvisit w
@@ -133,6 +134,14 @@ let children node = node.deps
 let pp_list pp_content fmt v =
   List.iter ~f:(fun f -> Format.fprintf fmt "%a;@, " pp_content f) v
 
-let rec pp pp_content fmt n =
-  Format.fprintf fmt "(%d: k=%d, i=%d) (%a) [@[<hov 2>%a@]]" n.id n.level n.index pp_content (get n) (pp pp_content |> pp_list) n.deps
+let rec pp_depth depth pp_content fmt n =
+  if depth >= 20 then
+    Format.fprintf fmt "..."
+  else
+    Format.fprintf fmt "(%d: k=%d, i=%d) (%a) [@[%a@]]" n.id n.level n.index pp_content (get n) (pp_depth (depth + 1) pp_content |> pp_list) n.deps
 
+let pp pp_content fmt n =
+  pp_depth 0 pp_content fmt n
+
+let is_child v w =
+  v.deps |> List.exists ~f:(fun c -> c.id = w.id)

@@ -111,28 +111,18 @@ module Id = struct
   let gen () = Id_gen.gen idgen
 end
 
-module Index = struct
-  include Id_gen
-
-  let idgen = Id_gen.create ()
-  let gen () = - (Id_gen.gen idgen |> to_int)
-end
-
 let global_cache_table : (name * ser_input, global_cache_info) Hashtbl.t = Hashtbl.create 256
 
-type dependency_info = {
+type dep_info = {
   name : name;
   input : ser_input;
   id : Id.t;
-  mutable index : int;
-  mutable level : int;
-  mutable deps : dependency_info list;
-  mutable rev_deps : dependency_info list;
-  mutable trans_deps : Id.Set.t;
 }
 
-let global_arc_counter = ref 0
-let global_dep_table : (name * ser_input, dependency_info) Hashtbl.t = Hashtbl.create 256
+type dep_node = dep_info Dag.node
+
+let global_dep_dag = Dag.create ()
+let global_dep_table : (name * ser_input, dep_node) Hashtbl.t = Hashtbl.create 256
 
 module CRef = struct
   type ('a, 'b) t = 'a -> 'b Fiber.t
@@ -164,7 +154,7 @@ module Memoize = struct
   type stack_frame = {
     name : name;
     input : ser_input;
-    dep_info : dependency_info;
+    dep_node : dep_node;
   }
 
   type 'output output_cache = {
@@ -282,7 +272,7 @@ module Memoize = struct
   let update_global_cache (name : name) (inp : ser_input) (outp : global_cache_info) =
     Hashtbl.replace global_cache_table ~key:(name, inp) ~data:outp
 
-  let get_dependency_info (name : name) (inp : ser_input) : dependency_info =
+  let get_dependency_node (name : name) (inp : ser_input) : dep_node =
     Hashtbl.find global_dep_table (name, inp)
     |> function
       | None ->
@@ -291,16 +281,13 @@ module Memoize = struct
           id = newId;
           name = name;
           input = inp;
-          index = Index.gen ();
-          level = 1;
-          deps = [];
-          rev_deps = [];
-          trans_deps = Id.Set.singleton newId;
         } in
-        Hashtbl.replace global_dep_table ~key:(name,inp) ~data:entry;
-        entry
+        let node = Dag.node global_dep_dag entry in
+        Hashtbl.replace global_dep_table ~key:(name,inp) ~data:node;
+        node
       | Some t -> t
 
+  (*
   let _dependency_cycle_error ~(last:dependency_info) ~(rev_dep:dependency_info) =
     let fmt (di : dependency_info) =
         Printf.sprintf "%s %s" di.name di.input in
@@ -313,95 +300,17 @@ module Memoize = struct
     let cycle = build_loop [fmt last] rev_dep in
     die "Dependency cycle between the following files:\n    %s"
       (String.concat ~sep:"\n--> " cycle)
+  *)
 
-  let add_rev_dep (dep_info : dependency_info) =
-    let add (v : dependency_info) (w : dependency_info) = 
-      let n = Hashtbl.length global_dep_table in
-      let m = !global_arc_counter in
-      let delta = min (float m ** (1.0 /. 2.0)) (float n ** (2.0 /. 3.0)) |> (+.) 20.0 |> int_of_float in
-      (* Printf.printf "m:%d n:%d delta:%d\n%!" m n delta; *)
-
-      global_arc_counter := m + 1;
-
-      (* Printf.printf "new add %s -> %s\n%!" v.input w.input; *)
-      let marked_ids = ref Id.Set.empty in
-      let arcs = ref 0 in
-      let f = ref [] in
-      let b = ref [] in
-
-      (* A New Approach to Incremental Cycle Detection and Related Problems *)
-      let rec bvisit (y : dependency_info) acc =
-        marked_ids := Id.Set.union !marked_ids (Id.Set.singleton y.id);
-        if List.exists y.rev_deps ~f:(fun x -> btraverse x y (x :: acc)) |> not then begin
-          b := List.append !b [y];
-          false end
-        else
-          true
-      and btraverse (x : dependency_info) (_y : dependency_info) acc =
-        if x.id = w.id then
-          die "cycle btraverse\n   %s" (acc |> List.map ~f:(fun (d : dependency_info) -> d.input) |> String.concat ~sep:"\n   -->");
-        arcs := !arcs + 1;
-        if !arcs >= delta then begin
-          w.level <- v.level + 1;
-          w.rev_deps <- [];
-          b := []; 
-          true
-        end else begin
-          if Id.Set.mem x.id !marked_ids |> not then
-            bvisit x acc
-          else 
-            false
-        end in
-
-      let rec fvisit (x : dependency_info) =
-        List.iter x.deps ~f:(fun y -> ftraverse x y);
-        f := x :: !f 
-      and ftraverse (x : dependency_info) (y : dependency_info) =
-        if y.id = v.id || List.exists ~f:(fun (di : dependency_info) -> di.id = y.id) !b then
-          die "cycle ftraverse";
-        if y.level < w.level then begin
-          y.level <- w.level;
-          y.rev_deps <- [];
-          fvisit y
-        end;
-        if y.level = w.level then
-          y.rev_deps <- x :: y.rev_deps in
-
-      (* step 1: test order *)
-      if (v.level < w.level || (v.level = w.level && v.index < w.index)) |> not then
-      begin
-        (* step 2 *)
-        let step2res = bvisit v [v; w] in
-
-        (* step 3 *)
-        if step2res then
-          fvisit w
-        else if w.level = v.level then begin
-          w.level <- v.level;
-          w.rev_deps <- [];
-          fvisit w
-        end;
-
-        (* step 4 *)
-        let l = List.rev (List.append !b !f) in
-        List.iter ~f:(fun x -> x.index <- Index.gen ()) l
-      end;
-
-      (* step 5 *)
-      v.deps <- w :: v.deps;
-      if v.level = w.level then
-        w.rev_deps <- v :: w.rev_deps
-      in
-
-    let di = dep_info in
+  let add_rev_dep dep_node =
     get_call_stack
     >>| function
         | [] -> ()
         | x :: _ ->
-            let rev_dep = x.dep_info in
+            let rev_dep = x.dep_node in
             (* if the caller doesn't already contain this as a dependent *)
-            if List.exists rev_dep.deps ~f:(fun d -> d.id = di.id) |> not then
-              add rev_dep di
+            if Dag.is_child rev_dep dep_node |> not then
+              Dag.add rev_dep dep_node
 
   let get_deps (name : name) (inp : ser_input) =
     let c = last_global_cache name inp in
@@ -464,49 +373,51 @@ module Memoize = struct
 
   let rec memoization (cache : 'b t) (name : name) (in_spec : 'a input_spec) (out_spec : 'b output_spec) (comp : 'a -> 'b Fiber.t) : ('a -> 'b Fiber.t) =
     (* the computation that force computes the fiber *)
-    let recompute inp (dep_info : dependency_info) comp updatefn =
+    let recompute inp dep_node comp updatefn =
+      let di : dep_info = Dag.get dep_node in
       (* create an ivar so other threads can wait for the computation to finish *)
       let ivar : 'b Fiber.Ivar.t = Fiber.Ivar.create () in
       (* create an output cache entry with our ivar *)
-      set_running_output_cache cache name dep_info.input dep_info.id ivar
+      set_running_output_cache cache name di.input di.id ivar
       (* define the function to update / double check intermediate result *)
       (* set context of computation then run it *)
       >>= (fun _ ->
-        comp inp |> wrap_fiber { name; input = dep_info.input; dep_info } dep_info.id)
-      >>= check dep_info.id (* mark the current node as up to date *)
+        comp inp |> wrap_fiber { name; input = di.input; dep_node } di.id)
+      >>= check di.id (* mark the current node as up to date *)
       (* update the output cache with the correct value *)
-      >>= update_caches cache name dep_info.input out_spec dep_info.id updatefn
+      >>= update_caches cache name di.input out_spec di.id updatefn
       (* fill the ivar for any waiting threads *)
       >>= (fun res -> Fiber.Ivar.fill ivar res >>= fun _ -> Fiber.return res) in
 
     (* the function has already been calculated, determine if
        any inputs have been updated otherwise return the cached
        value *)
-    let cached_computation inp (dep_info : dependency_info) ginfo res updatefn =
-      dependencies_updated dep_info.id ginfo |> ignore_deps
+    let cached_computation inp (dep_node : dep_node) ginfo res updatefn =
+      dependencies_updated (Dag.get dep_node).id ginfo |> ignore_deps
       >>= (fun updated ->
         if updated then
-          recompute inp dep_info comp updatefn
+          recompute inp dep_node comp updatefn
         else
           Fiber.return res
       ) in
 
     (* determine if the function is still executing *)
-    let caching_computation inp (dep_info : dependency_info) rinfo updatefn =
+    let caching_computation inp (dep_node : dep_node) rinfo updatefn =
+      let di = Dag.get dep_node in
       match rinfo.state with
       | Running fut ->
-        find_cycle rinfo.id {name = dep_info.name; input = dep_info.input; dep_info = dep_info} inp
+        find_cycle rinfo.id {name = di.name; input = di.input; dep_node = dep_node} inp
         >>= (fun _ -> Fiber.Ivar.read fut)
       | Done res ->
-        let ginfo = last_global_cache_exn name dep_info.input in
-        cached_computation inp dep_info ginfo res updatefn in
+        let ginfo = last_global_cache_exn name di.input in
+        cached_computation inp dep_node ginfo res updatefn in
 
     (* determine if there is an output cache entry *)
     (fun inp ->
       let ser_inp = in_spec.serialize inp in
       Fiber.return inp
       >>= (fun inp ->
-        let dep_info = get_dependency_info name ser_inp in
+        let dep_info = get_dependency_node name ser_inp in
         let updatefn =
           inp
           |> memoization cache name in_spec out_spec comp

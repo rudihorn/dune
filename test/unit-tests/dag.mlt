@@ -1,0 +1,28 @@
+open Stdune;;
+open Dag;;
+
+type mynode = {
+  name : string;
+}
+
+let dag : mynode Dag.t = Dag.create ();;
+
+let node = Dag.node dag { name = "root" };;
+let node11 = Dag.node dag { name = "child 1 1" };;
+let node12 = Dag.node dag { name = "child 1 2" };;
+let node21 = Dag.node dag { name = "child 2 1" };;
+let node31 = Dag.node dag { name = "child 3 1" };;
+
+Dag.add node node11;;
+Dag.add node node12;;
+Dag.add node12 node21;;
+Dag.add node21 node31;;
+
+let pp_mynode fmt n =
+  Format.fprintf fmt "%s" n.name;;
+
+Format.asprintf "%a" (Dag.pp pp_mynode) node;;
+
+[%%expect{|
+hello
+|}]

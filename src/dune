@@ -3,6 +3,7 @@
  (libraries   unix
               stdune
               fiber
+              dag
               xdg
               dune_re
               threads

@@ -319,7 +319,7 @@ module Memoize = struct
       let n = Hashtbl.length global_dep_table in
       let m = !global_arc_counter in
       let delta = min (float m ** (1.0 /. 2.0)) (float n ** (2.0 /. 3.0)) |> (+.) 20.0 |> int_of_float in
-      Printf.printf "m:%d n:%d delta:%d\n%!" m n delta;
+      (* Printf.printf "m:%d n:%d delta:%d\n%!" m n delta; *)
 
       global_arc_counter := m + 1;
 

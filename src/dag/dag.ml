@@ -1,6 +1,10 @@
 open! Stdune
 
-(* A New Approach to Incremental Cycle Detection and Related Problems *)
+(* Based on the work by:
+
+Michael A. Bender, Jeremy T. Fineman, Seth Gilbert, and Robert E. Tarjan. 2015. A New Approach to Incremental Cycle Detection and Related Problems. ACM Trans. Algorithms 12, 2, Article 14 (December 2015), 22 pages. DOI: https://doi.org/10.1145/2756553
+
+*)
 
 module Kind = struct 
   type 'a tag = ..
@@ -27,23 +31,6 @@ module Kind = struct
     | B.X -> Some Type_eq.T
     | _   -> None
 end
-
-module type S = sig
-  type t
-
-  val kind : t Kind.t
-end
-
-module Make
-    (T : sig
-       type t
-     end)
-  : S with type t = T.t =
-struct
-  type t = T.t
-  let kind = Kind.create ()
-end
-
 
 type 'a t = {
   kind : 'a Kind.t;

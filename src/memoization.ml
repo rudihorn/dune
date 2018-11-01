@@ -40,12 +40,7 @@ type global_cache_info = {
   last_deps : (name * ser_input * ser_output) list;
 }
 
-module Id = struct
-  include Id_gen
-
-  let idgen = Id_gen.create ()
-  let gen () = Id_gen.gen idgen
-end
+module Ids = Id.Make()
 
 let global_cache_table : (name * ser_input, global_cache_info) Hashtbl.t = Hashtbl.create 256
 
@@ -143,10 +138,10 @@ module Memoize = struct
     >>= function
     | None -> assert false
     | Some set ->
-      if Id.Set.mem id !set then
+      if Id.Set.mem !set id then
         Fiber.return true
       else
-        (set := Id.Set.add id !set;
+        (set := Id.Set.add !set id;
         Fiber.return false)
 
   (* mark the current node as up to date *)
@@ -155,7 +150,7 @@ module Memoize = struct
     >>| function
     | None -> assert false
     | Some set ->
-        set := Id.Set.add id !set;
+        set := Id.Set.add !set id;
         v
 
   let run_memoize fiber =
@@ -171,7 +166,7 @@ module Memoize = struct
     let f = Fiber.Var.set dep_key dep_ref f in
     (* set the context so that f has the call stack  *)
     get_call_stack_int
-      >>| (fun (stack, set) -> stack_frame :: stack, Id.Set.add id set) (* add top entry *)
+      >>| (fun (stack, set) -> stack_frame :: stack, Id.Set.add set id) (* add top entry *)
       >>= (fun stack -> Fiber.Var.set call_stack_key stack f) (* update *)
 
   let dump_stack v =
@@ -184,7 +179,7 @@ module Memoize = struct
   let find_cycle id sf v =
     get_call_stack_int
       >>| (fun (stack,set) ->
-             if Id.Set.mem id set then
+             if Id.Set.mem set id then
                let printrule rule = Printf.sprintf "%s %s" rule.name rule.input in
                die "Dependency cycle between the following computations:\n    %s\n -> %s"
                  (printrule sf)
@@ -234,7 +229,7 @@ module Memoize = struct
     Hashtbl.find global_dep_table (name, inp)
     |> function
       | None ->
-        let newId = Id.gen () in
+        let newId = Ids.gen () in
         let entry = {
           id = newId;
           name = name;
@@ -368,6 +363,8 @@ module Memoize = struct
       Fiber.return inp
       >>= (fun inp ->
         let dep_info = get_dependency_node name ser_inp in
+        (* generate the function which recomputes the memoized function
+           to ensure it is up to date *)
         let updatefn =
           inp
           |> memoization cache name in_spec out_spec comp

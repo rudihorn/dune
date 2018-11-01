@@ -26,19 +26,30 @@ type 'a output_spec = {
   cutoff_policy : cutoff_policy;
 }
 
+(** Computation References are used to allow the recursive definitions of files. Similar to IVar's,
+    the user can create a deferred computation by calling [deferred], get it's value with [get] and
+    fill the value with [set]. *)
 module CRef : sig 
   type ('a, 'b) t = 'a -> 'b Fiber.t
 
   type ('a, 'b) comp
 
+  (** [deferred ()] creates a deferred computation. *)
   val deferred : unit -> ('a, 'b) comp
+
+  (** [set comp f] set's the value that is returned by [get comp] to [f].
+      @raise Exn.Fatal_error if [set] was already called *)
   val set : ('a, 'b) comp -> ('a, 'b) t -> unit
+
+  (** [get comp] returns the [f] if [set comp f] was called.
+      @raise Exn.Fatal_error if [set] has not been called yet. *)
   val get : ('a, 'b) comp -> ('a, 'b) t
 end
 
 type dep_info
 type dep_node
 
+(** A stack frame within a computation. *)
 type stack_frame = {
   name : name;
   input : ser_input;
@@ -50,11 +61,13 @@ module CycleException : sig
 
   exception MemCycle of memoized_cycle_exception
 
+  (** Return the stack leading to the node which raised the cycle. *)
   val stack : memoized_cycle_exception -> dep_node list
 
+  (** Return the nodes which create a cycle. *)
   val cycle : memoized_cycle_exception -> dep_node list
 
-  (* get the inputs of all entries with the specified name *)
+  (** Get the inputs of all entries with the specified name. **)
   val filter : name:name -> memoized_cycle_exception -> ser_input list
 end
 
@@ -76,11 +89,13 @@ module Memoize : sig
 
       The function returns a new fiber of type 'a -> 'b Fiber.t, which automatically
       tries to find the old result and otherwise recomputes it.
+
+      Running the computation may raise [MemCycle] if a cycle is detected.
   *)
   val memoization : 'b t -> name -> 'a input_spec -> 'b output_spec -> ('a -> 'b Fiber.t) -> ('a -> 'b Fiber.t)
 
   (** After running a memoization function with a given name and input, it is possibly to query
-      which dependencies that function used during execution by calling `get_deps` with the
+      which dependencies that function used during execution by calling [get_deps] with the
       name and input used during execution. *)
   val get_deps : name -> ser_input -> (name * ser_input) list option
 

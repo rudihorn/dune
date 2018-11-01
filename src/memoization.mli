@@ -15,13 +15,6 @@ type 'a input_spec = {
   not_equal : 'a -> 'a -> bool;
 }
 
-val string_input_spec : string input_spec
-val int_input_spec : int input_spec
-val dummy_input_spec : 'a input_spec
-val path_input_spec : Path.t input_spec
-val pair_l_input_spec : 'a input_spec -> 'b input_spec -> ('a * 'b) input_spec
-val pair_r_input_spec : 'a input_spec -> 'b input_spec -> ('a * 'b) input_spec
-
 (** The cutoff policy of an output type. *)
 type cutoff_policy =
   | No_cutoff (** The output should not be compared and the function should always be recomputed. *)
@@ -32,10 +25,6 @@ type 'a output_spec = {
   print : 'a -> string;
   cutoff_policy : cutoff_policy;
 }
-
-val int_output_spec : int output_spec;;
-val string_output_spec : string output_spec;;
-val eager_function_output_spec : 'a output_spec;;
 
 module CRef : sig 
   type ('a, 'b) t = 'a -> 'b Fiber.t
@@ -50,14 +39,27 @@ end
 type dep_info
 type dep_node
 
-module Memoize : sig
-  type 'a t 
+type stack_frame = {
+  name : name;
+  input : ser_input;
+  dep_node : dep_node;
+}
 
-  type stack_frame = {
-    name : name;
-    input : ser_input;
-    dep_node : dep_node;
-  }
+module CycleException : sig
+  type memoized_cycle_exception
+
+  exception MemCycle of memoized_cycle_exception
+
+  val stack : memoized_cycle_exception -> dep_node list
+
+  val cycle : memoized_cycle_exception -> dep_node list
+
+  (* get the inputs of all entries with the specified name *)
+  val filter : name:name -> memoized_cycle_exception -> ser_input list
+end
+
+module Memoize : sig
+  type 'a t
 
   (** Create a cache used by the memoization for the specific output type.
       Each output type requires its own cache. *)
@@ -92,7 +94,7 @@ module Memoize : sig
   (** Print the memoized call stack during execution. This is useful for debugging purposes.
       Example code:
         some_fiber_computation
-        >>= dump_stack
+       >>= dump_stack
         >>= some_more_computation
   *)
   val dump_stack : 'a -> 'a Fiber.t

@@ -49,6 +49,10 @@ let unwrap_exn = function
   | E (exn, entries) -> (exn, Some entries)
   | exn -> (exn, None)
 
+let map ~f = function
+  | E (exn, entries) -> E (f exn, entries)
+  | exn -> f exn
+
 let () =
   Printexc.register_printer (function
     | E (exn, _) -> Some (Printexc.to_string exn)

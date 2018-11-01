@@ -7,6 +7,7 @@ module Exn        = Exn
 module Filename   = Filename
 module Hashtbl    = Hashtbl
 module Int        = Int
+module Id         = Id
 module Io         = Io
 module List       = List
 module Map        = Map

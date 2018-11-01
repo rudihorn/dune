@@ -3,6 +3,7 @@ open Import
 (* open Staged *)
 open Fiber.O
 
+(* type used for names of memoized functions *)
 type name = string
 
 (* seralized input / output types *)
@@ -14,57 +15,9 @@ type 'a input_spec = {
   print : 'a -> string;
   not_equal : 'a -> 'a -> bool;
 }
-
-let id v = v
-
-let string_input_spec = {
-  serialize = id;
-  print = id;
-  not_equal = fun s1 s2 -> s1 <> s2;
-}
-
-let show pp v =
-  let bf = Buffer.create 256 in
-  let fmt = Format.formatter_of_buffer bf in
-  pp fmt v;
-  Format.pp_print_flush fmt ();
-  Buffer.contents bf
-
-let pair_l_input_spec s1 _s2 = {
-  serialize = (fun (a,_) -> s1.serialize a);
-  print = (fun (a,_) -> s1.print a);
-  not_equal = fun (s1,_) (s2,_) -> s1 <> s2;
-}
-
-let pair_r_input_spec _s1 s2 = {
-  serialize = (fun (_,b) -> s2.serialize b);
-  print = (fun (_,b) -> s2.print b);
-  not_equal = fun (_,s1) (_,s2) -> s1 <> s2;
-}
-
-let path_input_spec = {
-  serialize = (show Path.pp);
-  print = (show Path.pp);
-  not_equal = fun s1 s2 -> s1 <> s2;
-}
-
-let dummy_input_spec = {
-  serialize = (fun _ -> "");
-  print = (fun _ -> "dummy");
-  not_equal = fun _ _ -> true;
-}
-
-let int_input_spec = {
-  serialize = string_of_int;
-  print = string_of_int;
-  not_equal = fun i1 i2 -> i1 <> i2;
-}
-
-
-
 type cutoff_policy =
-  | No_cutoff 
-  | Cutoff 
+  | No_cutoff
+  | Cutoff
 
 type 'a output_spec = {
   serialize : 'a -> ser_output;
@@ -72,25 +25,8 @@ type 'a output_spec = {
   cutoff_policy : cutoff_policy;
 }
 
-let int_output_spec = {
-  serialize = string_of_int;
-  print = string_of_int;
-  cutoff_policy = Cutoff;
-}
-
-let string_output_spec = {
-  serialize = id;
-  print = id;
-  cutoff_policy = Cutoff;
-}
-let rfn _ =  "<fun>"
-let eager_function_output_spec = {
-  serialize = rfn;
-  print = rfn;
-  cutoff_policy = No_cutoff;
-}
-
-(* a function that will try to recompute the memoized function *)
+(* a function that will try to recompute the memoized function to ensure
+   the output is up-to-date *)
 type update_cache = unit -> ser_output Fiber.t
 
 type 'output run_state =
@@ -121,10 +57,34 @@ type dep_info = {
 
 type dep_node = dep_info Dag.node
 
+type stack_frame = {
+  name : name;
+  input : ser_input;
+  dep_node : dep_node;
+}
+
+module CycleException = struct
+  type memoized_cycle_exception = {
+    cycle : dep_node list;
+    stack : dep_node list;
+  }
+
+  exception MemCycle of memoized_cycle_exception
+
+  let stack ex = ex.stack
+
+  let cycle ex = ex.cycle
+
+  let filter ~(name:name) ex =
+    ex.cycle
+    |> List.filter ~f:(fun (f : dep_node) -> (Dag.get f).name = name)
+    |> List.map ~f:(fun (f : dep_node) -> (Dag.get f).input)
+
+end
+
+
 let global_dep_dag = Dag.create ()
 let global_dep_table : (name * ser_input, dep_node) Hashtbl.t = Hashtbl.create 256
-module Test = struct type t = dep_info list end
-module DepInfoListKind = Dag.Make(Test)
 
 module CRef = struct
   type ('a, 'b) t = 'a -> 'b Fiber.t
@@ -152,12 +112,6 @@ end
 
 
 module Memoize = struct
-
-  type stack_frame = {
-    name : name;
-    input : ser_input;
-    dep_node : dep_node;
-  }
 
   type 'output output_cache = {
     state : 'output run_state;
@@ -239,11 +193,13 @@ module Memoize = struct
       >>| (fun _ -> v)
 
   let add_dep (dep : string) (inp : ser_input) x =
-    (* get_call_stack_int
-      >>| (function | [],_ -> "(root)" | x :: _, _ -> x.name ^ " " ^ x.input)
-      >>| (fun from -> Printf.printf "%s -> %s %s\n%!" from dep inp)
-    >>> *)
-    Fiber.Var.get dep_key >>= (fun deps -> Option.iter deps ~f:(fun deps -> deps := (dep,inp) :: !deps); (Fiber.return x))
+    Fiber.Var.get dep_key
+    >>= (fun deps ->
+      Option.iter deps ~f:(fun deps ->
+        deps := (dep,inp) :: !deps
+      );
+      (Fiber.return x)
+    )
 
   let ignore_deps fiber =
     Fiber.Var.set dep_key (ref []) fiber
@@ -267,7 +223,7 @@ module Memoize = struct
 
   let _last_output_cache_exn (v : 'b t) (name : name) (inp : ser_input) =
     last_output_cache v name inp |> Option.value_exn
- 
+
   let update_cache (v : 'b t) (name : name) (inp : ser_input) (rinfo : 'b output_cache) =
     Hashtbl.replace v.cache ~key:(name, inp) ~data:rinfo
 
@@ -289,37 +245,22 @@ module Memoize = struct
         node
       | Some t -> t
 
-  (*
-  let _dependency_cycle_error ~(last:dependency_info) ~(rev_dep:dependency_info) =
-    let fmt (di : dependency_info) =
-        Printf.sprintf "%s %s" di.name di.input in
-    let rec build_loop acc (t : dependency_info) =
-      if t.id = last.id then
-        fmt last :: acc
-      else
-        let next_rev_dep = List.find_exn t.rev_deps ~f:(fun di -> Id.Set.mem last.id di.trans_deps) in
-        build_loop (fmt t :: acc) next_rev_dep in
-    let cycle = build_loop [fmt last] rev_dep in
-    die "Dependency cycle between the following files:\n    %s"
-      (String.concat ~sep:"\n--> " cycle)
-  *)
-
   let add_rev_dep dep_node =
     get_call_stack
     >>| function
         | [] -> ()
-        | x :: _ ->
+        | x :: _ as stack ->
             let rev_dep = x.dep_node in
             (* if the caller doesn't already contain this as a dependent *)
-            try 
+            try
               if Dag.is_child rev_dep dep_node |> not then
                 Dag.add rev_dep dep_node
             with Dag.Cycle packed ->
-              let cycle =
-                Dag.unpack_list (Dag.dag dep_node) packed
-                |> List.map ~f:(fun (n : dep_node) -> (Dag.get n).input) in
-              die "Dependency cycle between the following files:\n    %s"
-                (String.concat ~sep:"\n--> " cycle)
+              let cycle = Dag.unpack_list (Dag.dag dep_node) packed in
+              CycleException.MemCycle {
+                stack = List.map stack ~f:(fun st -> st.dep_node);
+                cycle = cycle;
+              } |> raise
 
   let get_deps (name : name) (inp : ser_input) =
     let c = last_global_cache name inp in

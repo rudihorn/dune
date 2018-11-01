@@ -1,8 +1,11 @@
+(* -*- tuareg -*- *)
+
 open Dune;;
 open Stdune;;
 open Fiber.O;;
 open Memoization;;
 open Memoization.Memoize;;
+open Memoization_specs;;
 
 Fiber.return 5;;
 [%%expect{|
@@ -10,7 +13,12 @@ Fiber.return 5;;
 |}]
 
 (* to run a computation *)
-let run f v = f v |> Memoize.run_memoize |> Fiber.run;;
+let run f v =
+  let exn = ref None in
+  try 
+    Fiber.with_error_handler (fun () -> f v) ~on_error:(fun e -> exn := Some e) |> Memoize.run_memoize |> Fiber.run
+  with Fiber.Never ->
+    Option.value ~default:Fiber.Never !exn |> raise;;
 
 (* the trivial dependencies are simply the identity function *)
 let compdep x = Fiber.return (x ^ x);;
@@ -125,7 +133,7 @@ let mcompcycle =
           if !counter < 20 then
             ((x + 1) mod 3) |> CRef.get mcompcycle
           else
-            Fiber.never
+            failwith "cycle"
         ) in
   memoization ismemcached "cycle" int_input_spec string_output_spec compcycle |> CRef.set mcompcycle;
   CRef.get mcompcycle;;
@@ -138,18 +146,24 @@ val mcompcycle : (int, string) CRef.t = <fun>
 |}]
 
 counter := 0;
-run mcompcycle 5;;
+try
+ run mcompcycle 5 |> ignore;
+ None
+with
+ | CycleException.MemCycle exn ->
+     let cycle = CycleException.filter ~name:"cycle" exn in
+     Some cycle;;
 !counter;;
 !stack;;
 
 [%%expect{|
-Exception: Never.
-Raised at file "src/fiber/fiber.ml", line 428, characters 20-25
-Called from file "toplevel/toploop.ml", line 180, characters 17-56
+- : string list option = Some ["2"; "1"; "0"; "2"]
 - : int = 4
 - : stack_frame list =
-[{name = "cycle"; input = "2"}; {name = "cycle"; input = "1"};
- {name = "cycle"; input = "0"}; {name = "cycle"; input = "5"}]
+[{name = "cycle"; input = "2"; dep_node = <abstr>};
+ {name = "cycle"; input = "1"; dep_node = <abstr>};
+ {name = "cycle"; input = "0"; dep_node = <abstr>};
+ {name = "cycle"; input = "5"; dep_node = <abstr>}]
 |}]
 
 let iimemcached = create_cache ();;

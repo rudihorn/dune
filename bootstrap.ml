@@ -33,6 +33,7 @@ let dirs =
   ; "src/stdune/caml"        , Some "Dune_caml"
   ; "src/stdune"             , Some "Stdune"
   ; "src/fiber"              , Some "Fiber"
+  ; "src/dag"                , Some "Dag"
   ; "src/xdg"                , Some "Xdg"
   ; "src/ocaml-config"       , Some "Ocaml_config"
   ; "vendor/boot"            , None

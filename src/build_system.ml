@@ -1254,7 +1254,7 @@ let build_request t static_only ~request =
   |> if static_only then prepare_rule t else build_rule t
 
 let process_memcycle exn =
-  let cycle = CycleException.filter exn ~name:"build_file" in
+  let cycle = CycleException.filter exn ~name:"build-file" in
   let last = List.last cycle |> Option.value_exn in
   let first = List.hd cycle in
   let cycle = if last = first then cycle else last :: cycle in
@@ -1347,13 +1347,13 @@ let rule_id_string inp =
       ; prepare_rule_def = CRef.deferred ()
       }
     in
-    Memoize.memoization file_cache "prepare_rule" rule_input_spec ignore_output_spec (prepare_rule t)
+    Memoize.memoization file_cache "prepare-rule" rule_input_spec ignore_output_spec (prepare_rule t)
       |> CRef.set t.prepare_rule_def;
-    Memoize.memoization file_cache "build_rule" rule_input_spec ignore_output_spec (build_rule t)
+    Memoize.memoization file_cache "build-rule" rule_input_spec ignore_output_spec (build_rule t)
       |> CRef.set t.build_rule_def;
-    Memoize.memoization unit_cache "build_rule_internal" internal_rule_input_spec ignore_output_spec (build_rule_internal t)
+    Memoize.memoization unit_cache "build-rule-internal" internal_rule_input_spec ignore_output_spec (build_rule_internal t)
       |> CRef.set t.build_rule_internal_def;
-    Memoize.memoization unit_cache "build_file" path_input_spec ignore_output_spec (build_file t)
+    Memoize.memoization unit_cache "build-file" path_input_spec ignore_output_spec (build_file t)
       |> CRef.set t.build_file_def;
     Hooks.End_of_build.once (fun () -> finalize t);
     t
@@ -1685,3 +1685,16 @@ end
 
 let is_target t file =
   Path.Set.mem (targets_of t ~dir:(Path.parent_exn file)) file
+
+let register_computations bs cs =
+  let decoder =
+    let open Dune_lang.Decoder in
+    plain_string (fun ~loc s -> Path.of_string s,Some loc) in
+  let decode sexp =
+    Dune_lang.Decoder.parse decoder Univ_map.empty sexp in
+  let comp = (fun sexp ->
+    decode sexp |> Fiber.return
+    >>= CRef.get bs.build_file_def
+    >>| (fun () -> Dune_lang.atom "")
+  ) in
+  Computations.register cs ~key:"build-file" ~comp

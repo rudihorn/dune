@@ -11,6 +11,7 @@ type setup =
   ; packages     : Package.t Package.Name.Map.t
   ; file_tree    : File_tree.t
   ; env          : Env.t
+  ; computations : Computations.t
   }
 
 let package_install_file { packages; _ } pkg =
@@ -40,6 +41,7 @@ let setup ?(log=Log.no_log)
       ?profile
       () =
   let env = setup_env ~capture_outputs in
+  let cs = Computations.create () in
   let conf =
     Dune_load.load ?extra_ignored_subtrees ?ignore_promoted_rules ()
   in
@@ -93,6 +95,7 @@ let setup ?(log=Log.no_log)
   let build_system =
     Build_system.create ~contexts ~file_tree:conf.file_tree ~hook
   in
+  Build_system.register_computations build_system cs;
   Gen_rules.gen conf
     ~build_system
     ~contexts
@@ -108,6 +111,7 @@ let setup ?(log=Log.no_log)
     ; packages = conf.packages
     ; file_tree = conf.file_tree
     ; env
+    ; computations = cs
     }
 
 let find_context_exn t ~name =

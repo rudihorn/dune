@@ -325,6 +325,45 @@ let external_lib_deps =
   in
   (term, Term.info "external-lib-deps" ~doc ~man)
 
+let compute =
+  let doc = "Compute internal function." in
+  let man =
+    [ `S "DESCRIPTION"
+    ; `P {|<TO DO>|}
+    ]
+  in
+  let term =
+    let%map common = Common.term
+    and fn =
+      Arg.(required
+           & pos 0 (some string) None
+           & info [] ~docv:"FUNCTION"
+               ~doc:"Compute $(docv) for a given input.")
+    and inp =
+      Arg.(required
+           & pos 1 (some string) None
+           & info [] ~docv:"INPUT"
+               ~doc:"Use $(docv) as the input to the function.")
+    in
+    Common.set_common common ~targets:[];
+    let log = Log.create common in
+    Scheduler.go ~log ~common
+      (Main.setup ~log common ~external_lib_deps_mode:true
+       >>= fun setup ->
+        let sexp = Dune_lang.parse_string ~fname:"" ~mode:Dune_lang.Parser.Mode.Single inp in
+        let comp = Computations.get setup.computations ~key:fn in
+        match comp with
+        | None -> failwith "Computation not found."
+        | Some comp -> comp sexp
+        >>= fun res ->
+        let sexp = Dune_lang.Ast.remove_locs sexp in
+        Printf.printf "Run function %s on input %s yielded output:  %s\n%!"
+          fn (Dune_lang.to_string ~syntax:Dune_lang.Dune sexp)
+          (Dune_lang.to_string ~syntax:Dune_lang.Dune res);
+        Fiber.return ()) in
+  (term, Term.info "compute" ~doc ~man)
+
+
 let rules =
   let doc = "Dump internal rules." in
   let man =
@@ -1150,6 +1189,7 @@ let all =
   ; printenv
   ; Help.help
   ; fmt
+  ; compute
   ]
 
 let default =

@@ -8,6 +8,7 @@ type setup =
   ; packages     : Package.t Package.Name.Map.t
   ; file_tree    : File_tree.t
   ; env          : Env.t
+  ; computations : Computations.t
   }
 
 (* Returns [Error ()] if [pkg] is unknown *)

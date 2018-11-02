@@ -262,3 +262,6 @@ val build_rules
 
 (** Dump various databases on disk *)
 val finalize : t -> unit
+
+val register_computations : t -> Computations.t -> unit
+

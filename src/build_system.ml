@@ -86,7 +86,6 @@ module Internal_rule = struct
     ; mode             : Dune_file.Rule.Mode.t
     ; loc              : Loc.t option
     ; dir              : Path.t
-    ; start_rule       : unit -> unit (* legacy for hooks *)
     ; run_rule         : Action.t -> Deps.t -> unit Fiber.t (* the actual computation *)
     ; (* Reverse dependencies discovered so far, labelled by the
          requested target *)
@@ -117,7 +116,6 @@ module Internal_rule = struct
     ; mode        = Standard
     ; loc         = None
     ; dir         = Path.root
-    ; start_rule  = ignore
     ; run_rule    = (fun _ _ -> Fiber.return ())
     ; rev_deps    = []
     ; transitive_rev_deps = Id.Set.empty
@@ -387,8 +385,8 @@ type t =
     packages : Package.Name.t Path.Table.t
   ; load_dir_cache : Path.Set.t Memoize.t
   (* memoized functions *)
-  ; prepare_rule_def : (Internal_rule.t * Static_deps.t * (unit, Action.t) Build.t, Action.t * Deps.t) CRef.comp
-  ; build_rule_def : (Internal_rule.t * Static_deps.t * (unit, Action.t) Build.t, Action.t * Deps.t) CRef.comp
+  ; prepare_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) CRef.comp
+  ; build_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) CRef.comp
   ; build_file_def : (Path.t * Loc.t option, unit) CRef.comp
   ; build_rule_internal_def : (Internal_rule.t, unit) CRef.comp
   }
@@ -690,6 +688,9 @@ let no_rule_found =
           ctx
           (hint ctx (String.Map.keys t.contexts))
 
+let start_rule t _rule =
+  t.hook Rule_started
+
 let rec compile_rule t ?(copy_source=false) pre_rule =
   let { Pre_rule.
         context
@@ -709,9 +710,6 @@ let rec compile_rule t ?(copy_source=false) pre_rule =
     lazy (Build_interpret.static_deps build ~all_targets:(targets_of t)
             ~file_tree:t.file_tree)
   in
-
-  let start_rule () =
-    t.hook Rule_started in
 
   let run_rule action deps =
     make_local_dir t dir;
@@ -813,7 +811,6 @@ let rec compile_rule t ?(copy_source=false) pre_rule =
     ; targets
     ; build
     ; context
-    ; start_rule = start_rule
     ; run_rule = run_rule
     ; mode
     ; loc
@@ -1184,24 +1181,26 @@ let parallel_iter_path_set deps ~f =
 let parallel_iter_deps deps ~f =
   Deps.paths deps |> parallel_iter_path_set ~f 
 
-let prepare_rule t (rule, static_deps, build : Internal_rule.t * Static_deps.t * ('a, 'b) Build.t) : ('b * Deps.t) Fiber.t =
+let prepare_rule t (rule, build : Internal_rule.t * ('a, 'b) Build.t) : ('b * Deps.t) Fiber.t =
   (* get the static dependencies needed before we can call build exec*)
-  let rule_deps = Static_deps.rule_deps static_deps in
+  let deps = Lazy.force rule.static_deps in
+  let rule_deps = Static_deps.rule_deps deps in
 
-  rule.start_rule (); (* legacy for hooks *)
+  start_rule t rule; (* legacy for hooks *)
   (* first compute rule dependencies*)
   parallel_iter_deps rule_deps ~f:(fun f -> CRef.get t.build_file_def (f,rule.loc))
-  (* then execute the build *)
+  (* then execute the build arrow *)
   >>| Build_exec.exec t build
 
-let build_rule t (rule, static_deps, build : Internal_rule.t * Static_deps.t * ('a, 'b) Build.t) =
+let build_rule t (rule, build : Internal_rule.t * ('a, 'b) Build.t) =
   (* get the static dependencies needed before we can call build exec*)
-  let action_deps = Static_deps.action_deps static_deps in
-  let rule_deps = Static_deps.rule_deps static_deps in
+  let deps = Lazy.force rule.static_deps in
+  let action_deps = Static_deps.action_deps deps in
+  let rule_deps = Static_deps.rule_deps deps in
 
   let build_file = (fun f -> CRef.get t.build_file_def (f,rule.loc)) in
 
-  Fiber.fork (fun () -> (rule, static_deps, build) |> prepare_rule t)
+  Fiber.fork (fun () -> (rule, build) |> prepare_rule t)
   >>= (fun rule_eval ->
     (* now compute the action dependencies *)
     Fiber.fork (fun () -> parallel_iter_deps action_deps ~f:build_file)
@@ -1217,8 +1216,7 @@ let build_rule t (rule, static_deps, build : Internal_rule.t * Static_deps.t * (
   )
 
 let build_rule_internal t (rule : Internal_rule.t) =
-  let static_deps = Lazy.force rule.static_deps in
-  (rule, static_deps, rule.build) |> CRef.get t.build_rule_def
+  (rule, rule.build) |> CRef.get t.build_rule_def
   >>= (fun (action, all_deps) -> rule.run_rule action all_deps)
 
 (* a rule can have multiple files, but rule.run_rule may only be called once *)
@@ -1237,20 +1235,20 @@ let build_file t (path, loc) : unit Fiber.t =
 let _prepare_file t path =
   let prepare_file_spec (File_spec.T file) =
     let rule = file.rule in
-    let static_deps = Lazy.force rule.static_deps in
-    (rule, static_deps, rule.build) |> CRef.get t.prepare_rule_def in 
+    (rule, rule.build) |> CRef.get t.prepare_rule_def in 
   get_file_spec t ~loc:None path 
   >>= (function
       | None -> (* file already exists *) Fiber.return ()
       | Some file -> (* build *) prepare_file_spec file >>| ignore)
 
 let build_request t static_only ~request =
-  let static_deps =
+  let static_deps = lazy (
     Build_interpret.static_deps
       request
       ~all_targets:(targets_of t)
-      ~file_tree:t.file_tree in
-  (Internal_rule.root, static_deps, request)
+      ~file_tree:t.file_tree) in
+  let rule = { Internal_rule.root with static_deps } in
+  (rule, request)
   |> if static_only then prepare_rule t else build_rule t
 
 let process_memcycle exn =
@@ -1286,7 +1284,7 @@ let path_input_spec = {
   not_equal = path_compare;
 }
 
-let rule_get (r, _, _ : Internal_rule.t * Static_deps.t * ('a, 'b) Build.t) = r
+let rule_get (r, _ : Internal_rule.t * ('a, 'b) Build.t) = r
 let rule_id_string inp =
   let r = rule_get inp in
   let s = Printf.sprintf "%s"
@@ -1453,8 +1451,7 @@ let rules_for_files rules deps =
 let build_rules_internal ?(recursive=false) t ~request =
   let rules = ref [] in
   let rec run_rule (rule : Internal_rule.t) =
-    let static_deps = Lazy.force rule.static_deps in
-    (rule, static_deps, rule.build) |> CRef.get t.prepare_rule_def
+    (rule, rule.build) |> CRef.get t.prepare_rule_def
     >>= (fun (action,deps) ->
       let rule = {
         Rule.
@@ -1546,7 +1543,7 @@ let package_deps t pkg files =
         rules_seen := Rule.Id.Set.add !rules_seen ir.id;
         let static_deps = Lazy.force ir.static_deps in
         let rule_deps = Static_deps.rule_deps static_deps in
-        (ir, static_deps, ir.build) |> CRef.get t.build_rule_def 
+        (ir, ir.build) |> CRef.get t.build_rule_def 
         >>= (fun (_,deps ) ->
           let dyn_deps = Deps.path_diff deps rule_deps in
           let action_deps = Static_deps.action_deps static_deps |> Deps.paths in

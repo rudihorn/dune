@@ -391,6 +391,7 @@ type t =
   ; build_rule_def : (Internal_rule.t * Static_deps.t * (unit, Action.t) Build.t, Action.t * Deps.t) CRef.comp
   ; build_file_def : (Path.t * Loc.t option, unit) CRef.comp
   ; build_rule_internal_def : (Internal_rule.t, unit) CRef.comp
+  ; load_dir_def : (Path.t, Path.Set.t) CRef.comp
   }
 
 let string_of_paths set =
@@ -1286,6 +1287,14 @@ let path_input_spec = {
   not_equal = path_compare;
 }
 
+let dir_input_spec = {
+  Memoization.
+  serialize = Path.to_string;
+  print = Path.to_string;
+  not_equal = (fun a b -> a <> b);
+}
+
+
 let rule_get (r, _, _ : Internal_rule.t * Static_deps.t * ('a, 'b) Build.t) = r
 let rule_id_string inp =
   let r = rule_get inp in
@@ -1318,6 +1327,7 @@ let ignore_output_spec = {
 }
 
 let unit_cache = Memoize.create_cache ()
+let path_cache = Memoize.create_cache ()
 
 let create ~contexts ~file_tree ~hook =
   Utils.Cached_digest.load ();
@@ -1345,6 +1355,7 @@ let create ~contexts ~file_tree ~hook =
     ; build_file_def = CRef.deferred ()
     ; build_rule_internal_def = CRef.deferred ()
     ; prepare_rule_def = CRef.deferred ()
+    ; load_dir_def = CRef.deferred ()
     }
   in
   Memoize.memoization file_cache "prepare-rule" rule_input_spec ignore_output_spec (prepare_rule t)
@@ -1355,6 +1366,8 @@ let create ~contexts ~file_tree ~hook =
   |> CRef.set t.build_rule_internal_def;
   Memoize.memoization unit_cache "build-file" path_input_spec ignore_output_spec (build_file t)
   |> CRef.set t.build_file_def;
+  Memoize.memoization path_cache "load-dir" dir_input_spec ignore_output_spec (fun dir -> targets_of t ~dir |> Fiber.return)
+  |> CRef.set t.load_dir_def;
   Hooks.End_of_build.once (fun () -> finalize t);
   t
 
@@ -1697,4 +1710,19 @@ let register_computations bs cs =
     >>= CRef.get bs.build_file_def
     >>| (fun () -> Dune_lang.atom "")
   ) in
-  Computations.register cs ~key:"build-file" ~comp
+  Computations.register cs ~key:"build-file" ~comp;
+  let decoder =
+    let open Dune_lang.Decoder in
+    plain_string (fun ~loc:_loc s -> Path.of_string s) in
+  let decode sexp =
+    Dune_lang.Decoder.parse decoder Univ_map.empty sexp in
+  let comp = (fun sexp ->
+    decode sexp |> Fiber.return
+    >>= CRef.get bs.load_dir_def
+    >>| (fun dat ->
+      Path.Set.to_list dat
+      |> List.map ~f:Path.to_string
+      |> List.map ~f:Dune_lang.atom
+      |> (fun a -> Dune_lang.List a))
+  ) in
+  Computations.register cs ~key:"load-dir" ~comp

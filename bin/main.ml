@@ -348,7 +348,7 @@ let compute =
     Common.set_common common ~targets:[];
     let log = Log.create common in
     Scheduler.go ~log ~common
-      (Main.setup ~log common ~external_lib_deps_mode:true
+      (Memoization.Memoize.run_memoize (Main.setup ~log common ~external_lib_deps_mode:true
        >>= fun setup ->
         let sexp = Dune_lang.parse_string ~fname:"" ~mode:Dune_lang.Parser.Mode.Single inp in
         let comp = Computations.get setup.computations ~key:fn in
@@ -360,7 +360,7 @@ let compute =
         Printf.printf "Run function %s on input %s yielded output:  %s\n%!"
           fn (Dune_lang.to_string ~syntax:Dune_lang.Dune sexp)
           (Dune_lang.to_string ~syntax:Dune_lang.Dune res);
-        Fiber.return ()) in
+        Fiber.return ())) in
   (term, Term.info "compute" ~doc ~man)
 
 

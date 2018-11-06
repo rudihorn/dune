@@ -6,6 +6,16 @@ let id v = v
 let show pp v =
   Format.asprintf "%a" pp v
 
+let map ~f (input_spec : 'a input_spec) =
+  let ser x = f x |> input_spec.serialize in
+  let print x = f x |> input_spec.print in
+  let ne x y = input_spec.not_equal (f x) (f y) in
+  {
+    serialize = ser;
+    print = print;
+    not_equal = ne;
+  }
+
 let string_input_spec = {
   serialize = id;
   print = id;

@@ -5,6 +5,9 @@ open Memoization
 
 module Vspec = Build.Vspec
 
+
+
+
 (* Where we store stamp files for aliases *)
 let alias_dir = Path.(relative build_dir) ".aliases"
 
@@ -60,7 +63,7 @@ module Internal_rule = struct
 
   type t =
     { id               : Id.t
-    ; static_deps      : Static_deps.t Once.t
+    ; static_deps      : Static_deps.t Fiber.t
     ; targets          : Path.Set.t
     ; context          : Context.t option
     ; build            : (unit, Action.t) Build.t
@@ -84,15 +87,15 @@ module Internal_rule = struct
   let lib_deps t =
     (* Forcing this lazy ensures that the various globs and
        [if_file_exists] are resolved inside the [Build.t] value. *)
-    ignore (Once.get t.static_deps : Static_deps.t);
-    Build_interpret.lib_deps t.build
+    t.static_deps
+    >>| (fun _ -> Build_interpret.lib_deps t.build)
 
   (* Represent the build goal given by the user. This rule is never
      actually executed and is only used starting point of all
      dependency paths. *)
   let root =
     { id          = Id.gen ()
-    ; static_deps = Once.return Static_deps.empty
+    ; static_deps = Fiber.return Static_deps.empty
     ; targets     = Path.Set.empty
     ; context     = None
     ; build       = Build.return (Action.Progn [])
@@ -106,6 +109,56 @@ module Internal_rule = struct
     ; transitive_rev_deps = Id.Set.empty
     }
 end
+
+
+(* Memoization caches *)
+
+let file_cache = Memoize.create_cache ()
+
+let path_input_spec =
+  let ser (c, _) = Path.to_string c in
+  let ne (a,_) (b,_) = a <> b in
+  {
+    Memoization.
+    serialize = ser;
+    print = ser;
+    not_equal = ne;
+  }
+
+let rule_id_input_spec =
+  let ser r = Internal_rule.Id.to_int r |> string_of_int in
+  let ne x y = x <> y in
+  {
+    Memoization.
+    serialize = ser;
+    print = ser;
+    not_equal = ne;
+  }
+
+let rule_input_spec =
+  Memoization_specs.map ~f:(fun (r : Internal_rule.t) -> r.id) rule_id_input_spec
+
+let empty_string _ = "" 
+let ignore_output_spec = {
+  Memoization.
+  serialize = empty_string;
+  print = empty_string;
+  cutoff_policy = Cutoff;
+}
+
+let dir_input_spec = {
+  Memoization.
+  serialize = Path.to_string;
+  print = Path.to_string;
+  not_equal = (fun a b -> a <> b);
+}
+
+let unit_cache = Memoize.create_cache ()
+
+let static_deps_cache = Memoize.create_cache ()
+
+let path_cache = Memoize.create_cache ()
+
 
 module File_kind = struct
   type 'a t =
@@ -689,12 +742,16 @@ let rec compile_rule t ?(copy_source=false) pre_rule =
     pre_rule
   in
   let targets = Target.paths target_specs in
+  let static_deps _id =
+    Build_interpret.static_deps build ~all_targets:(targets_of t)
+      ~file_tree:t.file_tree
+    |> Fiber.return in
   let static_deps =
-    Once.make (fun () -> Build_interpret.static_deps build ~all_targets:(targets_of t)
-            ~file_tree:t.file_tree)
+    Memoize.memoization static_deps_cache "rule-static-deps" rule_id_input_spec ignore_output_spec static_deps
   in
   let rule =
     let id = Internal_rule.Id.gen () in
+    let static_deps = static_deps id in
     { Internal_rule.
       id
     ; static_deps
@@ -1181,36 +1238,39 @@ let parallel_iter_deps deps ~f =
 
 let prepare_rule t (rule, build : Internal_rule.t * ('a, 'b) Build.t) : ('b * Deps.t) Fiber.t =
   (* get the static dependencies needed before we can call build exec*)
-  let deps = Once.get rule.static_deps in
-  let rule_deps = Static_deps.rule_deps deps in
-
-  start_rule t rule; (* legacy for hooks *)
-  (* first compute rule dependencies*)
-  parallel_iter_deps rule_deps ~f:(fun f -> CRef.get t.build_file_def (f,rule.loc))
-  (* then execute the build arrow *)
+  rule.static_deps
+  >>| Static_deps.rule_deps 
+  >>= (fun rule_deps ->
+    start_rule t rule; (* legacy for hooks *)
+    (* first compute rule dependencies*)
+    parallel_iter_deps rule_deps ~f:(fun f -> CRef.get t.build_file_def (f,rule.loc))
+    (* then execute the build arrow *)
+  )
   >>| Build_exec.exec t build
 
 let build_rule t (rule, build : Internal_rule.t * ('a, 'b) Build.t) =
-  (* get the static dependencies needed before we can call build exec*)
-  let deps = Once.get rule.static_deps in
-  let action_deps = Static_deps.action_deps deps in
-  let rule_deps = Static_deps.rule_deps deps in
-
   let build_file = (fun f -> CRef.get t.build_file_def (f,rule.loc)) in
 
-  Fiber.fork (fun () -> (rule, build) |> prepare_rule t)
-  >>= (fun rule_eval ->
-    (* now compute the action dependencies *)
-    Fiber.fork (fun () -> parallel_iter_deps action_deps ~f:build_file)
-    (* wait for action dependencies *)
-    >>= Fiber.Future.wait
-    (* wait for rule dependencies *)
-    >>> Fiber.Future.wait rule_eval
-    (* wait for dynamic dependencies *)
-    >>= fun (action, dyn_deps) ->
-      Deps.path_diff dyn_deps rule_deps
-      |> parallel_iter_path_set ~f:build_file
-    >>> Fiber.return (action, Deps.union action_deps dyn_deps)
+  (* get the static dependencies needed before we can call build exec*)
+  rule.static_deps
+  >>= (fun deps -> 
+    let action_deps = Static_deps.action_deps deps in
+    let rule_deps = Static_deps.rule_deps deps in
+
+    Fiber.fork (fun () -> (rule, build) |> prepare_rule t)
+    >>= (fun rule_eval ->
+      (* now compute the action dependencies *)
+      Fiber.fork (fun () -> parallel_iter_deps action_deps ~f:build_file)
+      (* wait for action dependencies *)
+      >>= Fiber.Future.wait
+      (* wait for rule dependencies *)
+      >>> Fiber.Future.wait rule_eval
+      (* wait for dynamic dependencies *)
+      >>= fun (action, dyn_deps) ->
+        Deps.path_diff dyn_deps rule_deps
+        |> parallel_iter_path_set ~f:build_file
+      >>> Fiber.return (action, Deps.union action_deps dyn_deps)
+    )
   )
 
 let build_rule_internal t (rule : Internal_rule.t) =
@@ -1240,7 +1300,7 @@ let _prepare_file t path =
       | Some file -> (* build *) prepare_file_spec file >>| ignore)
 
 let build_request t static_only ~request =
-  let static_deps = Once.return (
+  let static_deps = Fiber.return (
     Build_interpret.static_deps
       request
       ~all_targets:(targets_of t)
@@ -1271,59 +1331,6 @@ let do_build (t : t) ~request =
   |> Memoize.run_memoize
   >>| (fun (res,_) -> res)
 
-let file_cache = Memoize.create_cache ()
-
-let dir_input_spec = {
-  Memoization.
-  serialize = Path.to_string;
-  print = Path.to_string;
-  not_equal = (fun a b -> a <> b);
-}
-
-let path_input_spec =
-  let ser (c, _) = Path.to_string c in
-  let ne (a,_) (b,_) = a <> b in
-  {
-    Memoization.
-    serialize = ser;
-    print = ser;
-    not_equal = ne;
-  }
-
-let rule_get (r, _ : Internal_rule.t * ('a, 'b) Build.t) = r
-let rule_id_string inp =
-  let r = rule_get inp in
-  let s = Printf.sprintf "%s"
-            (Internal_rule.Id.to_int r.id |> string_of_int) in
-  s
-
-let rule_input_spec = {
-  Memoization.
-  serialize = rule_id_string; 
-  print = rule_id_string;
-  not_equal = (fun r1 r2 -> (r1 |> rule_get).id <> (r2 |> rule_get).id);
-}
-
-let internal_rule_id_string (r : Internal_rule.t) =
-  Printf.sprintf "%s" (Internal_rule.Id.to_int r.id |> string_of_int)
-let internal_rule_input_spec = {
-  Memoization.
-  serialize = internal_rule_id_string; 
-  print = internal_rule_id_string;
-  not_equal = (fun r1 r2 -> r1.id <> r2.id);
-}
-
-let empty_string _ = "" 
-let ignore_output_spec = {
-  Memoization.
-  serialize = empty_string;
-  print = empty_string;
-  cutoff_policy = Cutoff;
-}
-
-let unit_cache = Memoize.create_cache ()
-let path_cache = Memoize.create_cache ()
-
 let create ~contexts ~file_tree ~hook =
   Utils.Cached_digest.load ();
   let contexts =
@@ -1353,11 +1360,12 @@ let create ~contexts ~file_tree ~hook =
     ; load_dir_def = CRef.deferred ()
     }
   in
-  Memoize.memoization file_cache "prepare-rule" rule_input_spec ignore_output_spec (prepare_rule t)
+  let fst_inp_spec = Memoization_specs.map ~f:(fun (r,_) -> r) rule_input_spec in
+  Memoize.memoization file_cache "prepare-rule" fst_inp_spec ignore_output_spec (prepare_rule t)
   |> CRef.set t.prepare_rule_def;
-  Memoize.memoization file_cache "build-rule" rule_input_spec ignore_output_spec (build_rule t)
+  Memoize.memoization file_cache "build-rule" fst_inp_spec ignore_output_spec (build_rule t)
   |> CRef.set t.build_rule_def;
-  Memoize.memoization unit_cache "build-rule-internal" internal_rule_input_spec ignore_output_spec (build_rule_internal t)
+  Memoize.memoization unit_cache "build-rule-internal" rule_input_spec ignore_output_spec (build_rule_internal t)
   |> CRef.set t.build_rule_internal_def;
   Memoize.memoization unit_cache "build-file" path_input_spec ignore_output_spec (build_file t)
   |> CRef.set t.build_file_def;
@@ -1379,14 +1387,14 @@ let rules_for_files t paths =
   |> Ir_set.to_list
 
 let rules_for_targets t targets =
-  match
-    Internal_rule.Id.Top_closure.top_closure
-      (rules_for_files t targets)
-      ~key:(fun (r : Internal_rule.t) -> r.id)
-      ~deps:(fun (r : Internal_rule.t) ->
-        let x = Once.get r.static_deps in
-        rules_for_files t (Static_deps.paths x))
-  with
+  Internal_rule.Id.Top_closure.top_closure_f
+    (rules_for_files t targets)
+    ~key:(fun (r : Internal_rule.t) -> r.id)
+    ~deps:(fun (r : Internal_rule.t) ->
+      r.static_deps
+      >>| Static_deps.paths
+      >>| rules_for_files t)
+  >>| function
   | Ok l -> l
   | Error cycle ->
     die "dependency cycle detected:\n   %s"
@@ -1404,33 +1412,41 @@ let static_deps_of_request t request =
 
 let all_lib_deps t ~request =
   let targets = static_deps_of_request t request in
-  List.fold_left (rules_for_targets t targets) ~init:Path.Map.empty
+  rules_for_targets t targets
+  >>=
+  List.fold_left ~init:(Fiber.return Path.Map.empty)
     ~f:(fun acc rule ->
-      let deps = Internal_rule.lib_deps rule in
+      Internal_rule.lib_deps rule
+      >>= fun deps ->
       if Lib_name.Map.is_empty deps then
         acc
       else
+        acc
+        >>| fun v ->
         let deps =
-          match Path.Map.find acc rule.dir with
+          match Path.Map.find v rule.dir with
           | None -> deps
           | Some deps' -> Lib_deps_info.merge deps deps'
         in
-        Path.Map.add acc rule.dir deps)
+        Path.Map.add v rule.dir deps)
 
 let all_lib_deps_by_context t ~request =
   let targets = static_deps_of_request t request in
-  let rules = rules_for_targets t targets in
-  List.fold_left rules ~init:[] ~f:(fun acc rule ->
-    let deps = Internal_rule.lib_deps rule in
+  rules_for_targets t targets
+  >>=
+  List.fold_left ~init:(Fiber.return []) ~f:(fun acc rule ->
+    Internal_rule.lib_deps rule
+    >>= fun deps ->
     if Lib_name.Map.is_empty deps then
       acc
     else
       match Path.extract_build_context rule.dir with
       | None -> acc
-      | Some (context, _) -> (context, deps) :: acc)
-  |> String.Map.of_list_multi
-  |> String.Map.filteri ~f:(fun ctx _ -> String.Map.mem t.contexts ctx)
-  |> String.Map.map ~f:(function
+      | Some (context, _) ->
+        acc >>| fun acc -> (context, deps) :: acc)
+  >>| String.Map.of_list_multi
+  >>| String.Map.filteri ~f:(fun ctx _ -> String.Map.mem t.contexts ctx)
+  >>| String.Map.map ~f:(function
     | [] -> Lib_name.Map.empty
     | x :: l -> List.fold_left l ~init:x ~f:Lib_deps_info.merge)
 
@@ -1551,13 +1567,15 @@ let package_deps t pkg files =
         Fiber.return acc
       else begin
         rules_seen := Rule.Id.Set.add !rules_seen ir.id;
-        let static_deps = Once.get ir.static_deps in
-        let rule_deps = Static_deps.rule_deps static_deps in
-        (ir, ir.build) |> CRef.get t.build_rule_def 
-        >>= (fun (_,deps ) ->
-          let dyn_deps = Deps.path_diff deps rule_deps in
-          let action_deps = Static_deps.action_deps static_deps |> Deps.paths in
-          Path.Set.fold (Path.Set.union action_deps dyn_deps) ~init:(acc |> Fiber.return) ~f:loop)
+        ir.static_deps
+        >>= (fun static_deps ->
+          let rule_deps = Static_deps.rule_deps static_deps in
+          (ir, ir.build) |> CRef.get t.build_rule_def
+          >>= (fun (_,deps ) ->
+            let dyn_deps = Deps.path_diff deps rule_deps in
+            let action_deps = Static_deps.action_deps static_deps |> Deps.paths in
+            Path.Set.fold (Path.Set.union action_deps dyn_deps) ~init:(acc |> Fiber.return) ~f:loop)
+        )
       end
   in
   let open Build.O in

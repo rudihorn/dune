@@ -40,7 +40,7 @@ type global_cache_info = {
   last_deps : (name * ser_input * ser_output) list;
 }
 
-module Ids = Id.Make()
+module Id = Id.Make()
 
 let global_cache_table : (name * ser_input, global_cache_info) Hashtbl.t = Hashtbl.create 256
 
@@ -229,7 +229,7 @@ module Memoize = struct
     Hashtbl.find global_dep_table (name, inp)
     |> function
       | None ->
-        let newId = Ids.gen () in
+        let newId = Id.gen () in
         let entry = {
           id = newId;
           name = name;

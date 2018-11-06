@@ -1,4 +1,5 @@
 type t = int
+
 let to_int x = x
 
 module IdGen = struct
@@ -22,20 +23,27 @@ module M = struct
   let compare (x : int) y = Int.compare x y
 end
 
-module Set = Set.Make(M)
-
 module type IdMod = sig
+  type t
+
+  module Set : Set_intf.S with type elt = t
+
   val idgen : IdGen.idgen
   val gen : unit -> t
   val peek : unit -> t
   val to_int : t -> int
+  val compare : t -> t -> Ordering.t
 end
 
 module Make () : IdMod = struct
+  module Set = Set.Make(M)
+  type t = int
+
   let idgen = IdGen.create ()
   let gen () = IdGen.gen idgen
   let peek () = IdGen.peek idgen
   let to_int = IdGen.to_int
+  let compare = Int.compare
 end
 
-
+module Set = Set.Make(M)

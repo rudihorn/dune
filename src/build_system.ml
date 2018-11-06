@@ -1708,7 +1708,7 @@ let register_computations bs cs =
   let comp = (fun sexp ->
     decode sexp |> Fiber.return
     >>= CRef.get bs.build_file_def
-    >>| (fun () -> Dune_lang.atom "")
+    >>| (fun () -> Dune_lang.atom "built")
   ) in
   Computations.register cs ~key:"build-file" ~comp;
   let decoder =

@@ -20,6 +20,10 @@ end
 module Set : Set_intf.S with type elt = t
 
 module type IdMod = sig
+  type t
+
+  module Set : Set_intf.S with type elt = t
+
   val idgen : IdGen.idgen
 
   (** Generate a new id. *)
@@ -31,6 +35,9 @@ module type IdMod = sig
 
   (** Convert the id to an integer. *)
   val to_int : t -> int
+
+  (** Compare two ids. *)
+  val compare : t -> t -> Ordering.t
 end
 
 (** A functor to create a new ID generator module. *)

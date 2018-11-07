@@ -26,7 +26,7 @@ type 'a output_spec = {
   cutoff_policy : cutoff_policy;
 }
 
-(** Computation References are used to allow the recursive definitions of files. Similar to IVar's,
+(** Computation References are used to allow the recursive definitions of memoized functions. Similar to IVar's,
     the user can create a deferred computation by calling [deferred], get it's value with [get] and
     fill the value with [set]. *)
 module CRef : sig 
@@ -46,38 +46,30 @@ module CRef : sig
   val get : ('a, 'b) comp -> ('a, 'b) t
 end
 
-type dep_info
-type dep_node
-
 (** A stack frame within a computation. *)
-type stack_frame = {
-  name : name;
-  input : ser_input;
-  dep_node : dep_node;
-}
+module Stack_frame : sig
+  type t
 
-module CycleException : sig
-  type memoized_cycle_exception
+  val name : t -> name
+  val input : t -> ser_input
+end
 
-  exception MemCycle of memoized_cycle_exception
+module Cycle_error : sig
+  type t
+
+  exception E of t
 
   (** Return the stack leading to the node which raised the cycle. *)
-  val stack : memoized_cycle_exception -> dep_node list
+  val stack : t -> Stack_frame.t list
 
-  (** Return the nodes which create a cycle. *)
-  val cycle : memoized_cycle_exception -> dep_node list
+  (** Get the inputs of all entries with the specified name. *)
+  val filter : name:name -> t -> ser_input list
 
-  (** Get the inputs of all entries with the specified name. **)
-  val filter : name:name -> memoized_cycle_exception -> ser_input list
+  (** Generate a list of strings for each entry in the cycle. *)
+  val serialize : t -> string list
 end
 
 module Memoize : sig
-  type 'a t
-
-  (** Create a cache used by the memoization for the specific output type.
-      Each output type requires its own cache. *)
-  val create_cache : unit -> 'a t
-
   (** Take a computation of the form 'a -> 'b Fiber.t and produced a memoized function
       which returns cached values. The arguments of the memoization function in order are:
         - An output cache where the outputs are stored
@@ -92,7 +84,7 @@ module Memoize : sig
 
       Running the computation may raise [MemCycle] if a cycle is detected.
   *)
-  val memoization : 'b t -> name -> 'a input_spec -> 'b output_spec -> ('a -> 'b Fiber.t) -> ('a -> 'b Fiber.t)
+  val memoization : name -> 'a input_spec -> 'b output_spec -> ('a -> 'b Fiber.t) -> ('a -> 'b Fiber.t)
 
   (** After running a memoization function with a given name and input, it is possibly to query
       which dependencies that function used during execution by calling [get_deps] with the
@@ -115,6 +107,6 @@ module Memoize : sig
   val dump_stack : 'a -> 'a Fiber.t
 
   (** Get the memoized call stack during the execution of a memoized function. *)
-  val get_call_stack : stack_frame list Fiber.t
+  val get_call_stack : Stack_frame.t list Fiber.t
 end
 

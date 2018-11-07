@@ -23,7 +23,7 @@ module M = struct
   let compare (x : int) y = Int.compare x y
 end
 
-module type IdMod = sig
+module type S = sig
   type t
 
   module Set : Set_intf.S with type elt = t
@@ -35,8 +35,9 @@ module type IdMod = sig
   val compare : t -> t -> Ordering.t
 end
 
-module Make () : IdMod = struct
-  module Set = Set.Make(M)
+module Make () : S = struct
+  module Set = Int.Set
+
   type t = int
 
   let idgen = IdGen.create ()

@@ -82,6 +82,11 @@ module Cycle_error = struct
     ex.cycle
     |> List.map ~f:Dag.get
     |> List.map ~f:(fun (f : dep_info) -> Format.sprintf "%s %s" f.name f.input)
+
+  let serialize_stack ex =
+    ex.stack
+    |> List.map ~f:(fun v -> Stack_frame.di v)
+    |> List.map ~f:(fun (f : dep_info) -> Format.sprintf "%s %s" f.name f.input)
 end
 
 

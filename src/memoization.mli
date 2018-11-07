@@ -67,6 +67,9 @@ module Cycle_error : sig
 
   (** Generate a list of strings for each entry in the cycle. *)
   val serialize : t -> string list
+
+  (** Generate a list of strings for each entry in the stack. *)
+  val serialize_stack : t -> string list
 end
 
 module Memoize : sig

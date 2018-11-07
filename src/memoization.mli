@@ -26,16 +26,16 @@ type 'a output_spec = {
   cutoff_policy : cutoff_policy;
 }
 
-(** Computation References are used to allow the recursive definitions of memoized functions. Similar to IVar's,
-    the user can create a deferred computation by calling [deferred], get it's value with [get] and
+(** Forward declarations are used to allow the recursive definitions of memoized functions. Similar to IVar's,
+    the user can create a forward declaration by calling [create], get it's value with [get] and
     fill the value with [set]. *)
-module CRef : sig 
+module Fdecl : sig
   type ('a, 'b) t = 'a -> 'b Fiber.t
 
   type ('a, 'b) comp
 
-  (** [deferred ()] creates a deferred computation. *)
-  val deferred : unit -> ('a, 'b) comp
+  (** [create ()] creates a forward declaration. *)
+  val create : unit -> ('a, 'b) comp
 
   (** [set comp f] set's the value that is returned by [get comp] to [f].
       @raise Exn.Fatal_error if [set] was already called *)

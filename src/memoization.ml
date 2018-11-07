@@ -88,7 +88,7 @@ end
 let global_dep_dag = Dag.create ()
 let global_dep_table : (name * ser_input, dep_node) Hashtbl.t = Hashtbl.create 256
 
-module CRef = struct
+module Fdecl = struct
   type ('a, 'b) t = 'a -> 'b Fiber.t
 
   type ('a, 'b) state =
@@ -99,7 +99,7 @@ module CRef = struct
     mutable state : ('a, 'b) state
   }
 
-  let deferred () = { state = Empty }
+  let create () = { state = Empty }
 
   let set comp f =
     match comp.state with

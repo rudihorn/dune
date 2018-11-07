@@ -66,9 +66,9 @@ val mcomp : string -> string Fiber.t = <fun>
    running it again should not, but should still return the
    same result *)
 !counter;;
-run mcomp "a";; 
+run mcomp "a";;
 !counter;;
-run mcomp "a";; 
+run mcomp "a";;
 !counter;;
 
 [%%expect{|
@@ -87,9 +87,9 @@ get_deps "test" "a";;
 
 (* running it on a new input should cause it to recompute
    the first time it is run *)
-run mcomp "hello";; 
+run mcomp "hello";;
 !counter;;
-run mcomp "hello";; 
+run mcomp "hello";;
 !counter;;
 
 [%%expect{|
@@ -119,24 +119,24 @@ let dump_stack v =
   get_call_stack >>| (fun s -> stack := s; v);;
 
 let mcompcycle =
-  let mcompcycle = CRef.deferred () in
+  let mcompcycle = Fdecl.create () in
   let compcycle x =
     Fiber.return x
     >>= dump_stack
     >>= (fun x ->
           counter := !counter + 1;
           if !counter < 20 then
-            ((x + 1) mod 3) |> CRef.get mcompcycle
+            ((x + 1) mod 3) |> Fdecl.get mcompcycle
           else
             failwith "cycle"
         ) in
-  memoization "cycle" int_input_spec string_output_spec compcycle |> CRef.set mcompcycle;
-  CRef.get mcompcycle;;
+  memoization "cycle" int_input_spec string_output_spec compcycle |> Fdecl.set mcompcycle;
+  Fdecl.get mcompcycle;;
 
 [%%expect{|
 val stack : '_weak1 list ref = {contents = []}
 val dump_stack : 'a -> 'a Fiber.t = <fun>
-val mcompcycle : (int, string) CRef.t = <fun>
+val mcompcycle : (int, string) Fdecl.t = <fun>
 |}]
 
 counter := 0;
@@ -158,9 +158,9 @@ with
 |}]
 
 let mfib =
-  let mfib = CRef.deferred () in
+  let mfib = Fdecl.create () in
   let compfib x =
-    let mfib = CRef.get mfib in
+    let mfib = Fdecl.get mfib in
     counter := !counter + 1;
     if x <= 1 then
       Fiber.return x
@@ -169,8 +169,8 @@ let mfib =
       >>= (fun r1 ->
         mfib (x - 2)
         >>| fun r2 -> r1 + r2) in
-  memoization "fib" int_input_spec int_output_spec compfib |> CRef.set mfib;
-  CRef.get mfib;;
+  memoization "fib" int_input_spec int_output_spec compfib |> Fdecl.set mfib;
+  Fdecl.get mfib;;
 
 counter := 0;
 run mfib 2000;;
@@ -178,7 +178,7 @@ run mfib 2000;;
 run mfib 1800;;
 
 [%%expect{|
-val mfib : (int, int) CRef.t = <fun>
+val mfib : (int, int) Fdecl.t = <fun>
 - : int = 2406280077793834213
 - : int = 2001
 - : int = 3080005411477819488

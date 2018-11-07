@@ -399,10 +399,10 @@ type t =
     packages : Package.Name.t Path.Table.t
   (* memoized functions *)
   ; cache_static_deps : (Memoization_cached.Id.t * Static_deps.t Fiber.t) -> (Static_deps.t Fiber.t)
-  ; prepare_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) CRef.comp
-  ; build_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) CRef.comp
-  ; build_file_def : (Path.t * Loc.t option, unit) CRef.comp
-  ; build_rule_internal_def : (Internal_rule.t, unit) CRef.comp
+  ; prepare_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) Fdecl.comp
+  ; build_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) Fdecl.comp
+  ; build_file_def : (Path.t * Loc.t option, unit) Fdecl.comp
+  ; build_rule_internal_def : (Internal_rule.t, unit) Fdecl.comp
   }
 
 let string_of_paths set =
@@ -1217,13 +1217,13 @@ let prepare_rule t (rule, build : Internal_rule.t * ('a, 'b) Build.t) : ('b * De
   >>= (fun rule_deps ->
     start_rule t rule; (* legacy for hooks *)
     (* first compute rule dependencies*)
-    parallel_iter_deps rule_deps ~f:(fun f -> CRef.get t.build_file_def (f,rule.loc))
+    parallel_iter_deps rule_deps ~f:(fun f -> Fdecl.get t.build_file_def (f,rule.loc))
     (* then execute the build arrow *)
   )
   >>| Build_exec.exec t build
 
 let build_rule t (rule, build : Internal_rule.t * ('a, 'b) Build.t) =
-  let build_file = (fun f -> CRef.get t.build_file_def (f,rule.loc)) in
+  let build_file = (fun f -> Fdecl.get t.build_file_def (f,rule.loc)) in
 
   (* get the static dependencies needed before we can call build exec*)
   rule.static_deps
@@ -1248,13 +1248,13 @@ let build_rule t (rule, build : Internal_rule.t * ('a, 'b) Build.t) =
   )
 
 let build_rule_internal t (rule : Internal_rule.t) =
-  (rule, rule.build) |> CRef.get t.build_rule_def
+  (rule, rule.build) |> Fdecl.get t.build_rule_def
   >>= (fun (action, all_deps) -> run_rule t rule action all_deps)
 
 (* a rule can have multiple files, but rule.run_rule may only be called once *)
 let build_file t (path, loc) : unit Fiber.t =
   let build_file_spec (File_spec.T file) =
-    file.rule |> CRef.get t.build_rule_internal_def in
+    file.rule |> Fdecl.get t.build_rule_internal_def in
   let on_error exn =
     Dep_path.reraise exn (Path path) in
   (fun () ->
@@ -1267,7 +1267,7 @@ let build_file t (path, loc) : unit Fiber.t =
 let _prepare_file t path =
   let prepare_file_spec (File_spec.T file) =
     let rule = file.rule in
-    (rule, rule.build) |> CRef.get t.prepare_rule_def in
+    (rule, rule.build) |> Fdecl.get t.prepare_rule_def in
   get_file_spec t ~loc:None path
   >>= (function
       | None -> (* file already exists *) Fiber.return ()
@@ -1328,21 +1328,21 @@ let create ~contexts ~file_tree ~hook =
     ; prefix = None
     ; hook
     ; cache_static_deps
-    ; build_rule_def = CRef.deferred ()
-    ; build_file_def = CRef.deferred ()
-    ; build_rule_internal_def = CRef.deferred ()
-    ; prepare_rule_def = CRef.deferred ()
+    ; build_rule_def = Fdecl.create ()
+    ; build_file_def = Fdecl.create ()
+    ; build_rule_internal_def = Fdecl.create ()
+    ; prepare_rule_def = Fdecl.create ()
     }
   in
   let fst_inp_spec = Memoization_specs.map ~f:(fun (r,_) -> r) rule_input_spec in
   Memoize.memoization "prepare_rule" fst_inp_spec Memoization_specs.ignore_output_spec (prepare_rule t)
-  |> CRef.set t.prepare_rule_def;
+  |> Fdecl.set t.prepare_rule_def;
   Memoize.memoization "build_rule" fst_inp_spec Memoization_specs.ignore_output_spec (build_rule t)
-  |> CRef.set t.build_rule_def;
+  |> Fdecl.set t.build_rule_def;
   Memoize.memoization "build_rule_internal" rule_input_spec Memoization_specs.ignore_output_spec (build_rule_internal t)
-  |> CRef.set t.build_rule_internal_def;
+  |> Fdecl.set t.build_rule_internal_def;
   Memoize.memoization "build_file" path_input_spec Memoization_specs.ignore_output_spec (build_file t)
-  |> CRef.set t.build_file_def;
+  |> Fdecl.set t.build_file_def;
   Hooks.End_of_build.once (fun () -> finalize t);
   t
 
@@ -1449,7 +1449,7 @@ let rules_for_files rules deps =
 let build_rules_internal ?(recursive=false) t ~request =
   let rules = ref [] in
   let rec run_rule (rule : Internal_rule.t) =
-    (rule, rule.build) |> CRef.get t.prepare_rule_def
+    (rule, rule.build) |> Fdecl.get t.prepare_rule_def
     >>= (fun (action,deps) ->
       let rule = {
         Rule.
@@ -1542,7 +1542,7 @@ let package_deps t pkg files =
         ir.static_deps
         >>= (fun static_deps ->
           let rule_deps = Static_deps.rule_deps static_deps in
-          (ir, ir.build) |> CRef.get t.build_rule_def
+          (ir, ir.build) |> Fdecl.get t.build_rule_def
           >>= (fun (_,deps ) ->
             let dyn_deps = Deps.path_diff deps rule_deps in
             let action_deps = Static_deps.action_deps static_deps |> Deps.paths in

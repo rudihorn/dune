@@ -1302,7 +1302,6 @@ let do_build (t : t) ~request =
       | _ as exn -> exn
     ) |> raise
   )
-  |> Memoize.run_memoize
   >>| (fun (res,_) -> res)
 
 let create ~contexts ~file_tree ~hook =

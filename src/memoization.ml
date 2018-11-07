@@ -52,29 +52,36 @@ type dep_info = {
 
 type dep_node = dep_info Dag.node
 
-type stack_frame = {
-  name : name;
-  input : ser_input;
-  dep_node : dep_node;
-}
-
-module CycleException = struct
-  type memoized_cycle_exception = {
-    cycle : dep_node list;
-    stack : dep_node list;
+module Stack_frame = struct
+  type t = {
+    dep_node : dep_node;
   }
 
-  exception MemCycle of memoized_cycle_exception
+  let di v = Dag.get v.dep_node
+
+  let name v = (di v).name
+  let input v = (di v).input
+end
+
+module Cycle_error = struct
+  type t = {
+    cycle : dep_node list;
+    stack : Stack_frame.t list;
+  }
+
+  exception E of t
 
   let stack ex = ex.stack
-
-  let cycle ex = ex.cycle
 
   let filter ~(name:name) ex =
     ex.cycle
     |> List.filter ~f:(fun (f : dep_node) -> (Dag.get f).name = name)
     |> List.map ~f:(fun (f : dep_node) -> (Dag.get f).input)
 
+  let serialize ex =
+    ex.cycle
+    |> List.map ~f:Dag.get
+    |> List.map ~f:(fun (f : dep_info) -> Format.sprintf "%s %s" f.name f.input)
 end
 
 
@@ -104,7 +111,6 @@ module CRef = struct
     | Empty -> die "Computation not set."
     | Full f -> f
 end
-
 
 module Memoize = struct
 
@@ -158,7 +164,7 @@ module Memoize = struct
 
   (* set up the fiber so that it both has an up to date call stack
      as well as an empty dependency table *)
-  let wrap_fiber (stack_frame : stack_frame) id (f : 'a Fiber.t) =
+  let wrap_fiber (stack_frame : Stack_frame.t) id (f : 'a Fiber.t) =
     let dep_ref = ref [] in
     (* transform f so it returns the dependencies after the computation *)
     let f = f >>= fun res -> Fiber.return (res,!dep_ref) in
@@ -173,18 +179,7 @@ module Memoize = struct
     get_call_stack
       >>|
         (Printf.printf "Memoized function stack:\n";
-        List.iter ~f:(fun st -> Printf.printf "   %s %s\n" st.name st.input))
-      >>| (fun _ -> v)
-
-  let find_cycle id sf v =
-    get_call_stack_int
-      >>| (fun (stack,set) ->
-             if Id.Set.mem set id then
-               let printrule rule = Printf.sprintf "%s %s" rule.name rule.input in
-               die "Dependency cycle between the following computations:\n    %s\n -> %s"
-                 (printrule sf)
-                 (List.map stack ~f:printrule
-                  |> String.concat ~sep:"\n -> "))
+        List.iter ~f:(fun st -> Printf.printf "   %s %s\n" (Stack_frame.name st) (Stack_frame.input st)))
       >>| (fun _ -> v)
 
   let add_dep (dep : string) (inp : ser_input) x =
@@ -252,8 +247,8 @@ module Memoize = struct
                 Dag.add rev_dep dep_node
             with Dag.Cycle packed ->
               let cycle = Dag.unpack_list (Dag.dag dep_node) packed in
-              CycleException.MemCycle {
-                stack = List.map stack ~f:(fun st -> st.dep_node);
+              Cycle_error.E {
+                stack = stack;
                 cycle = cycle;
               } |> raise
 
@@ -316,7 +311,9 @@ module Memoize = struct
     update_cache cache name ser_inp rinfo;
     Fiber.return res
 
-  let rec memoization (cache : 'b t) (name : name) (in_spec : 'a input_spec) (out_spec : 'b output_spec) (comp : 'a -> 'b Fiber.t) : ('a -> 'b Fiber.t) =
+  let memoization (name : name) (in_spec : 'a input_spec) (out_spec : 'b output_spec) (comp : 'a -> 'b Fiber.t) : ('a -> 'b Fiber.t) =
+    let cache = create_cache () in
+
     (* the computation that force computes the fiber *)
     let recompute inp dep_node comp updatefn =
       let di : dep_info = Dag.get dep_node in
@@ -327,7 +324,7 @@ module Memoize = struct
       (* define the function to update / double check intermediate result *)
       (* set context of computation then run it *)
       >>= (fun _ ->
-        comp inp |> wrap_fiber { name; input = di.input; dep_node } di.id)
+        comp inp |> wrap_fiber { dep_node } di.id)
       >>= check di.id (* mark the current node as up to date *)
       (* update the output cache with the correct value *)
       >>= update_caches cache name di.input out_spec di.id updatefn
@@ -351,14 +348,13 @@ module Memoize = struct
       let di = Dag.get dep_node in
       match rinfo.state with
       | Running fut ->
-        find_cycle rinfo.id {name = di.name; input = di.input; dep_node = dep_node} inp
-        >>= (fun _ -> Fiber.Ivar.read fut)
+        Fiber.Ivar.read fut
       | Done res ->
         let ginfo = last_global_cache_exn name di.input in
         cached_computation inp dep_node ginfo res updatefn in
 
     (* determine if there is an output cache entry *)
-    (fun inp ->
+    let rec loop () = fun inp ->
       let ser_inp = in_spec.serialize inp in
       Fiber.return inp
       >>= (fun inp ->
@@ -367,7 +363,7 @@ module Memoize = struct
            to ensure it is up to date *)
         let updatefn =
           inp
-          |> memoization cache name in_spec out_spec comp
+          |> loop ()
           |> (fun a () -> a >>| out_spec.serialize) in
         add_rev_dep dep_info
         >>> add_dep name ser_inp inp
@@ -375,6 +371,6 @@ module Memoize = struct
         >>= (function
             | None -> recompute inp dep_info comp updatefn
             | Some rinfo -> caching_computation inp dep_info rinfo updatefn)
-      )
-    )
+      ) in
+    loop ()
 end

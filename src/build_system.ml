@@ -113,8 +113,6 @@ end
 
 (* Memoization caches *)
 
-let file_cache = Memoize.create_cache ()
-
 let path_input_spec =
   let ser (c, _) = Path.to_string c in
   let ne (a,_) (b,_) = a <> b in
@@ -137,20 +135,6 @@ let rule_id_input_spec =
 
 let rule_input_spec =
   Memoization_specs.map ~f:(fun (r : Internal_rule.t) -> r.id) rule_id_input_spec
-
-let empty_string _ = "" 
-let ignore_output_spec = {
-  Memoization.
-  serialize = empty_string;
-  print = empty_string;
-  cutoff_policy = Cutoff;
-}
-
-let unit_cache = Memoize.create_cache ()
-
-let static_deps_cache = Memoize.create_cache ()
-
-
 
 module File_kind = struct
   type 'a t =
@@ -413,8 +397,8 @@ type t =
   ; hook : hook -> unit
   ; (* Package files are part of *)
     packages : Package.Name.t Path.Table.t
-  ; load_dir_cache : Path.Set.t Memoize.t
   (* memoized functions *)
+  ; cache_static_deps : (Memoization_cached.Id.t * Static_deps.t Fiber.t) -> (Static_deps.t Fiber.t)
   ; prepare_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) CRef.comp
   ; build_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) CRef.comp
   ; build_file_def : (Path.t * Loc.t option, unit) CRef.comp
@@ -733,16 +717,15 @@ let rec compile_rule t ?(copy_source=false) pre_rule =
     pre_rule
   in
   let targets = Target.paths target_specs in
-  let static_deps _id =
-    Build_interpret.static_deps build ~all_targets:(targets_of t)
-      ~file_tree:t.file_tree
-    |> Fiber.return in
   let static_deps =
-    Memoize.memoization static_deps_cache "rule-static-deps" rule_id_input_spec ignore_output_spec static_deps
+    Fiber.return ()
+    >>| fun () ->
+      Build_interpret.static_deps build ~all_targets:(targets_of t)
+        ~file_tree:t.file_tree in
+  let static_deps = Memoization_cached.cache t.cache_static_deps static_deps
   in
   let rule =
     let id = Internal_rule.Id.gen () in
-    let static_deps = static_deps id in
     { Internal_rule.
       id
     ; static_deps
@@ -1222,15 +1205,15 @@ let update_universe t =
   Io.write_file universe_file (Dune_lang.to_string ~syntax:Dune (Dune_lang.Encoder.int n))
 
 let parallel_iter_path_set deps ~f =
-  Path.Set.to_list deps |> Fiber.parallel_iter ~f 
+  Path.Set.to_list deps |> Fiber.parallel_iter ~f
 
 let parallel_iter_deps deps ~f =
-  Deps.paths deps |> parallel_iter_path_set ~f 
+  Deps.paths deps |> parallel_iter_path_set ~f
 
 let prepare_rule t (rule, build : Internal_rule.t * ('a, 'b) Build.t) : ('b * Deps.t) Fiber.t =
   (* get the static dependencies needed before we can call build exec*)
   rule.static_deps
-  >>| Static_deps.rule_deps 
+  >>| Static_deps.rule_deps
   >>= (fun rule_deps ->
     start_rule t rule; (* legacy for hooks *)
     (* first compute rule dependencies*)
@@ -1244,7 +1227,7 @@ let build_rule t (rule, build : Internal_rule.t * ('a, 'b) Build.t) =
 
   (* get the static dependencies needed before we can call build exec*)
   rule.static_deps
-  >>= (fun deps -> 
+  >>= (fun deps ->
     let action_deps = Static_deps.action_deps deps in
     let rule_deps = Static_deps.rule_deps deps in
 
@@ -1271,7 +1254,7 @@ let build_rule_internal t (rule : Internal_rule.t) =
 (* a rule can have multiple files, but rule.run_rule may only be called once *)
 let build_file t (path, loc) : unit Fiber.t =
   let build_file_spec (File_spec.T file) =
-    file.rule |> CRef.get t.build_rule_internal_def in 
+    file.rule |> CRef.get t.build_rule_internal_def in
   let on_error exn =
     Dep_path.reraise exn (Path path) in
   (fun () ->
@@ -1284,8 +1267,8 @@ let build_file t (path, loc) : unit Fiber.t =
 let _prepare_file t path =
   let prepare_file_spec (File_spec.T file) =
     let rule = file.rule in
-    (rule, rule.build) |> CRef.get t.prepare_rule_def in 
-  get_file_spec t ~loc:None path 
+    (rule, rule.build) |> CRef.get t.prepare_rule_def in
+  get_file_spec t ~loc:None path
   >>= (function
       | None -> (* file already exists *) Fiber.return ()
       | Some file -> (* build *) prepare_file_spec file >>| ignore)
@@ -1301,7 +1284,7 @@ let build_request t static_only ~request =
   |> if static_only then prepare_rule t else build_rule t
 
 let process_memcycle exn =
-  let cycle = CycleException.filter exn ~name:"build_file" in
+  let cycle = Cycle_error.filter exn ~name:"build_file" in
   let last = List.last cycle |> Option.value_exn in
   let first = List.hd cycle in
   let cycle = if last = first then cycle else last :: cycle in
@@ -1315,7 +1298,7 @@ let do_build (t : t) ~request =
   (fun () -> build_request t false ~request:request)
   |> Fiber.with_error_handler ~on_error:(fun exn ->
     Dep_path.map exn ~f:(function
-      | CycleException.MemCycle exn -> process_memcycle exn
+      | Cycle_error.E exn -> process_memcycle exn
       | _ as exn -> exn
     ) |> raise
   )
@@ -1328,6 +1311,7 @@ let create ~contexts ~file_tree ~hook =
     List.map contexts ~f:(fun c -> (c.Context.name, c))
     |> String.Map.of_list_exn
   in
+  let cache_static_deps = Memoization_cached.cached () in
   let t =
     { contexts
     ; files      = Path.Table.create 1024
@@ -1343,7 +1327,7 @@ let create ~contexts ~file_tree ~hook =
     ; files_of = Path.Table.create 1024
     ; prefix = None
     ; hook
-    ; load_dir_cache = Memoize.create_cache ()
+    ; cache_static_deps
     ; build_rule_def = CRef.deferred ()
     ; build_file_def = CRef.deferred ()
     ; build_rule_internal_def = CRef.deferred ()
@@ -1351,13 +1335,13 @@ let create ~contexts ~file_tree ~hook =
     }
   in
   let fst_inp_spec = Memoization_specs.map ~f:(fun (r,_) -> r) rule_input_spec in
-  Memoize.memoization file_cache "prepare_rule" fst_inp_spec ignore_output_spec (prepare_rule t)
+  Memoize.memoization "prepare_rule" fst_inp_spec Memoization_specs.ignore_output_spec (prepare_rule t)
   |> CRef.set t.prepare_rule_def;
-  Memoize.memoization file_cache "build_rule" fst_inp_spec ignore_output_spec (build_rule t)
+  Memoize.memoization "build_rule" fst_inp_spec Memoization_specs.ignore_output_spec (build_rule t)
   |> CRef.set t.build_rule_def;
-  Memoize.memoization unit_cache "build_rule_internal" rule_input_spec ignore_output_spec (build_rule_internal t)
+  Memoize.memoization "build_rule_internal" rule_input_spec Memoization_specs.ignore_output_spec (build_rule_internal t)
   |> CRef.set t.build_rule_internal_def;
-  Memoize.memoization unit_cache "build_file" path_input_spec ignore_output_spec (build_file t)
+  Memoize.memoization "build_file" path_input_spec Memoization_specs.ignore_output_spec (build_file t)
   |> CRef.set t.build_file_def;
   Hooks.End_of_build.once (fun () -> finalize t);
   t

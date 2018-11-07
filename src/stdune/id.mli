@@ -19,7 +19,7 @@ end
 
 module Set : Set_intf.S with type elt = t
 
-module type IdMod = sig
+module type S = sig
   type t
 
   module Set : Set_intf.S with type elt = t
@@ -41,4 +41,4 @@ module type IdMod = sig
 end
 
 (** A functor to create a new ID generator module. *)
-module Make () : IdMod
+module Make () : S

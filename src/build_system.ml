@@ -398,7 +398,7 @@ type t =
   ; (* Package files are part of *)
     packages : Package.Name.t Path.Table.t
   (* memoized functions *)
-  ; cache_static_deps : (Memoization_cached.Id.t * Static_deps.t Fiber.t) -> (Static_deps.t Fiber.t)
+  ; cache_static_deps : Static_deps.t Memoization_cached.t
   ; prepare_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) Fdecl.comp
   ; build_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) Fdecl.comp
   ; build_file_def : (Path.t * Loc.t option, unit) Fdecl.comp

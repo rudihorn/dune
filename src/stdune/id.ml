@@ -1,7 +1,7 @@
 module type S = sig
   type t
 
-  module Set : Set_intf.S with type elt = t
+  module Set : Set.S with type elt = t
 
   val gen : unit -> t
   val peek : unit -> t

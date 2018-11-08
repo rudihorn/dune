@@ -1,30 +1,9 @@
 open !Set
 
-type t
-
-(** Convert an ID to an integer. *)
-val to_int : t -> int
-
-(** The internal IdGen module which generates an
-    id using an instance of an ID generator for
-    the next ID. *)
-module IdGen : sig
-  type idgen 
-
-  val peek : idgen -> t
-  val create : unit -> idgen
-  val to_int : t -> int
-  val gen : idgen -> t
-end
-
-module Set : Set_intf.S with type elt = t
-
-module type IdMod = sig
+module type S = sig
   type t
 
   module Set : Set_intf.S with type elt = t
-
-  val idgen : IdGen.idgen
 
   (** Generate a new id. *)
   val gen : unit -> t
@@ -41,4 +20,4 @@ module type IdMod = sig
 end
 
 (** A functor to create a new ID generator module. *)
-module Make () : IdMod
+module Make () : S

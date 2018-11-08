@@ -15,7 +15,7 @@ Fiber.return 5;;
 (* to run a computation *)
 let run f v =
   let exn = ref None in
-  try 
+  try
     Fiber.with_error_handler (fun () -> f v) ~on_error:(fun e -> exn := Some e) |> Memoize.run_memoize |> Fiber.run
   with Fiber.Never ->
     Option.value ~default:Fiber.Never !exn |> raise;;
@@ -23,11 +23,9 @@ let run f v =
 (* the trivial dependencies are simply the identity function *)
 let compdep x = Fiber.return (x ^ x);;
 
-let memcache = create_cache ();;
-
 (* our two dependencies are called some and another *)
-let mcompdep1 = memoization memcache "some" string_input_spec string_output_spec compdep;;
-let mcompdep2 = memoization memcache "another" string_input_spec string_output_spec compdep;;
+let mcompdep1 = memoization "some" string_input_spec string_output_spec compdep;;
+let mcompdep2 = memoization "another" string_input_spec string_output_spec compdep;;
 
 (* compute the dependencies once so they are present in the
    global hash table *)
@@ -37,7 +35,6 @@ run mcompdep2 "a";;
 [%%expect{|
 val run : ('a -> 'b Fiber.t) -> 'a -> 'b = <fun>
 val compdep : string -> string Fiber.t = <fun>
-val memcache : '_weak1 t = <abstr>
 val mcompdep1 : string -> string Fiber.t = <fun>
 val mcompdep2 : string -> string Fiber.t = <fun>
 - : string = "aa"
@@ -51,13 +48,13 @@ let counter = ref 0;;
 (* our computation increases the counter, adds the two
    dependencies, "some" and "another" and works by multiplying
    the input by two *)
-let comp x = 
+let comp x =
   Fiber.return x >>=
   mcompdep1 >>=
   mcompdep2 >>=
   (fun a -> counter := !counter + 1; String.sub a 0 (String.length a |> min 3) |> Fiber.return);;
 
-let mcomp = memoization memcache "test" string_input_spec string_output_spec comp;;
+let mcomp = memoization "test" string_input_spec string_output_spec comp;;
 
 [%%expect{|
 val counter : int ref = {contents = 0}
@@ -69,9 +66,9 @@ val mcomp : string -> string Fiber.t = <fun>
    running it again should not, but should still return the
    same result *)
 !counter;;
-run mcomp "a";; 
+run mcomp "a";;
 !counter;;
-run mcomp "a";; 
+run mcomp "a";;
 !counter;;
 
 [%%expect{|
@@ -90,9 +87,9 @@ get_deps "test" "a";;
 
 (* running it on a new input should cause it to recompute
    the first time it is run *)
-run mcomp "hello";; 
+run mcomp "hello";;
 !counter;;
-run mcomp "hello";; 
+run mcomp "hello";;
 !counter;;
 
 [%%expect{|
@@ -117,32 +114,29 @@ run mcomp "hello";;
 - : int = 2
 |}]
 
-let ismemcached = create_cache ();;
-
 let stack = ref [];;
 let dump_stack v =
   get_call_stack >>| (fun s -> stack := s; v);;
 
 let mcompcycle =
-  let mcompcycle = CRef.deferred () in
-  let compcycle x = 
+  let mcompcycle = Fdecl.create () in
+  let compcycle x =
     Fiber.return x
     >>= dump_stack
     >>= (fun x ->
           counter := !counter + 1;
           if !counter < 20 then
-            ((x + 1) mod 3) |> CRef.get mcompcycle
+            ((x + 1) mod 3) |> Fdecl.get mcompcycle
           else
             failwith "cycle"
         ) in
-  memoization ismemcached "cycle" int_input_spec string_output_spec compcycle |> CRef.set mcompcycle;
-  CRef.get mcompcycle;;
+  memoization "cycle" int_input_spec string_output_spec compcycle |> Fdecl.set mcompcycle;
+  Fdecl.get mcompcycle;;
 
 [%%expect{|
-val ismemcached : '_weak2 t = <abstr>
-val stack : '_weak3 list ref = {contents = []}
+val stack : '_weak1 list ref = {contents = []}
 val dump_stack : 'a -> 'a Fiber.t = <fun>
-val mcompcycle : (int, string) CRef.t = <fun>
+val mcompcycle : (int, string) Fdecl.t = <fun>
 |}]
 
 counter := 0;
@@ -150,28 +144,23 @@ try
  run mcompcycle 5 |> ignore;
  None
 with
- | CycleException.MemCycle exn ->
-     let cycle = CycleException.filter ~name:"cycle" exn in
+ | Cycle_error.E exn ->
+     let cycle = Cycle_error.filter ~name:"cycle" exn in
      Some cycle;;
 !counter;;
-!stack;;
+!stack |> List.map ~f:(fun st -> Stack_frame.name st, Stack_frame.input st);;
 
 [%%expect{|
 - : string list option = Some ["2"; "1"; "0"; "2"]
 - : int = 4
-- : stack_frame list =
-[{name = "cycle"; input = "2"; dep_node = <abstr>};
- {name = "cycle"; input = "1"; dep_node = <abstr>};
- {name = "cycle"; input = "0"; dep_node = <abstr>};
- {name = "cycle"; input = "5"; dep_node = <abstr>}]
+- : (string * string) list =
+[("cycle", "2"); ("cycle", "1"); ("cycle", "0"); ("cycle", "5")]
 |}]
 
-let iimemcached = create_cache ();;
-
-let mfib = 
-  let mfib = CRef.deferred () in
+let mfib =
+  let mfib = Fdecl.create () in
   let compfib x =
-    let mfib = CRef.get mfib in
+    let mfib = Fdecl.get mfib in
     counter := !counter + 1;
     if x <= 1 then
       Fiber.return x
@@ -180,8 +169,8 @@ let mfib =
       >>= (fun r1 ->
         mfib (x - 2)
         >>| fun r2 -> r1 + r2) in
-  memoization iimemcached "fib" int_input_spec int_output_spec compfib |> CRef.set mfib;
-  CRef.get mfib;;
+  memoization "fib" int_input_spec int_output_spec compfib |> Fdecl.set mfib;
+  Fdecl.get mfib;;
 
 counter := 0;
 run mfib 2000;;
@@ -189,8 +178,7 @@ run mfib 2000;;
 run mfib 1800;;
 
 [%%expect{|
-val iimemcached : '_weak4 t = <abstr>
-val mfib : (int, int) CRef.t = <fun>
+val mfib : (int, int) Fdecl.t = <fun>
 - : int = 2406280077793834213
 - : int = 2001
 - : int = 3080005411477819488

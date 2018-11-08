@@ -113,8 +113,6 @@ end
 
 (* Memoization caches *)
 
-let file_cache = Memoize.create_cache ()
-
 let path_input_spec =
   let ser (c, _) = Path.to_string c in
   let ne (a,_) (b,_) = a <> b in
@@ -138,27 +136,12 @@ let rule_id_input_spec =
 let rule_input_spec =
   Memoization_specs.map ~f:(fun (r : Internal_rule.t) -> r.id) rule_id_input_spec
 
-let empty_string _ = "" 
-let ignore_output_spec = {
-  Memoization.
-  serialize = empty_string;
-  print = empty_string;
-  cutoff_policy = Cutoff;
-}
-
 let dir_input_spec = {
   Memoization.
   serialize = Path.to_string;
   print = Path.to_string;
   not_equal = (fun a b -> a <> b);
 }
-
-let unit_cache = Memoize.create_cache ()
-
-let static_deps_cache = Memoize.create_cache ()
-
-let path_cache = Memoize.create_cache ()
-
 
 module File_kind = struct
   type 'a t =
@@ -421,13 +404,13 @@ type t =
   ; hook : hook -> unit
   ; (* Package files are part of *)
     packages : Package.Name.t Path.Table.t
-  ; load_dir_cache : Path.Set.t Memoize.t
   (* memoized functions *)
-  ; prepare_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) CRef.comp
-  ; build_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) CRef.comp
-  ; build_file_def : (Path.t * Loc.t option, unit) CRef.comp
-  ; build_rule_internal_def : (Internal_rule.t, unit) CRef.comp
-  ; load_dir_def : (Path.t, Path.Set.t) CRef.comp
+  ; cache_static_deps : (Memoization_cached.Id.t * Static_deps.t Fiber.t) -> (Static_deps.t Fiber.t)
+  ; prepare_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) Fdecl.comp
+  ; build_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) Fdecl.comp
+  ; build_file_def : (Path.t * Loc.t option, unit) Fdecl.comp
+  ; build_rule_internal_def : (Internal_rule.t, unit) Fdecl.comp
+  ; load_dir_def : (Path.t, Path.Set.t) Fdecl.comp
   }
 
 let string_of_paths set =
@@ -742,16 +725,15 @@ let rec compile_rule t ?(copy_source=false) pre_rule =
     pre_rule
   in
   let targets = Target.paths target_specs in
-  let static_deps _id =
-    Build_interpret.static_deps build ~all_targets:(targets_of t)
-      ~file_tree:t.file_tree
-    |> Fiber.return in
   let static_deps =
-    Memoize.memoization static_deps_cache "rule-static-deps" rule_id_input_spec ignore_output_spec static_deps
+    Fiber.return ()
+    >>| fun () ->
+      Build_interpret.static_deps build ~all_targets:(targets_of t)
+        ~file_tree:t.file_tree in
+  let static_deps = Memoization_cached.cache t.cache_static_deps static_deps
   in
   let rule =
     let id = Internal_rule.Id.gen () in
-    let static_deps = static_deps id in
     { Internal_rule.
       id
     ; static_deps
@@ -1231,29 +1213,29 @@ let update_universe t =
   Io.write_file universe_file (Dune_lang.to_string ~syntax:Dune (Dune_lang.Encoder.int n))
 
 let parallel_iter_path_set deps ~f =
-  Path.Set.to_list deps |> Fiber.parallel_iter ~f 
+  Path.Set.to_list deps |> Fiber.parallel_iter ~f
 
 let parallel_iter_deps deps ~f =
-  Deps.paths deps |> parallel_iter_path_set ~f 
+  Deps.paths deps |> parallel_iter_path_set ~f
 
 let prepare_rule t (rule, build : Internal_rule.t * ('a, 'b) Build.t) : ('b * Deps.t) Fiber.t =
   (* get the static dependencies needed before we can call build exec*)
   rule.static_deps
-  >>| Static_deps.rule_deps 
+  >>| Static_deps.rule_deps
   >>= (fun rule_deps ->
     start_rule t rule; (* legacy for hooks *)
     (* first compute rule dependencies*)
-    parallel_iter_deps rule_deps ~f:(fun f -> CRef.get t.build_file_def (f,rule.loc))
+    parallel_iter_deps rule_deps ~f:(fun f -> Fdecl.get t.build_file_def (f,rule.loc))
     (* then execute the build arrow *)
   )
   >>| Build_exec.exec t build
 
 let build_rule t (rule, build : Internal_rule.t * ('a, 'b) Build.t) =
-  let build_file = (fun f -> CRef.get t.build_file_def (f,rule.loc)) in
+  let build_file = (fun f -> Fdecl.get t.build_file_def (f,rule.loc)) in
 
   (* get the static dependencies needed before we can call build exec*)
   rule.static_deps
-  >>= (fun deps -> 
+  >>= (fun deps ->
     let action_deps = Static_deps.action_deps deps in
     let rule_deps = Static_deps.rule_deps deps in
 
@@ -1274,13 +1256,13 @@ let build_rule t (rule, build : Internal_rule.t * ('a, 'b) Build.t) =
   )
 
 let build_rule_internal t (rule : Internal_rule.t) =
-  (rule, rule.build) |> CRef.get t.build_rule_def
+  (rule, rule.build) |> Fdecl.get t.build_rule_def
   >>= (fun (action, all_deps) -> run_rule t rule action all_deps)
 
 (* a rule can have multiple files, but rule.run_rule may only be called once *)
 let build_file t (path, loc) : unit Fiber.t =
   let build_file_spec (File_spec.T file) =
-    file.rule |> CRef.get t.build_rule_internal_def in 
+    file.rule |> Fdecl.get t.build_rule_internal_def in
   let on_error exn =
     Dep_path.reraise exn (Path path) in
   (fun () ->
@@ -1293,8 +1275,8 @@ let build_file t (path, loc) : unit Fiber.t =
 let _prepare_file t path =
   let prepare_file_spec (File_spec.T file) =
     let rule = file.rule in
-    (rule, rule.build) |> CRef.get t.prepare_rule_def in 
-  get_file_spec t ~loc:None path 
+    (rule, rule.build) |> Fdecl.get t.prepare_rule_def in
+  get_file_spec t ~loc:None path
   >>= (function
       | None -> (* file already exists *) Fiber.return ()
       | Some file -> (* build *) prepare_file_spec file >>| ignore)
@@ -1310,7 +1292,7 @@ let build_request t static_only ~request =
   |> if static_only then prepare_rule t else build_rule t
 
 let process_memcycle exn =
-  let cycle = CycleException.filter exn ~name:"build-file" in
+  let cycle = Cycle_error.filter exn ~name:"build-file" in
   let last = List.last cycle |> Option.value_exn in
   let first = List.hd cycle in
   let cycle = if last = first then cycle else last :: cycle in
@@ -1324,11 +1306,10 @@ let do_build (t : t) ~request =
   (fun () -> build_request t false ~request:request)
   |> Fiber.with_error_handler ~on_error:(fun exn ->
     Dep_path.map exn ~f:(function
-      | CycleException.MemCycle exn -> process_memcycle exn
+      | Cycle_error.E exn -> process_memcycle exn
       | _ as exn -> exn
     ) |> raise
   )
-  |> Memoize.run_memoize
   >>| (fun (res,_) -> res)
 
 let create ~contexts ~file_tree ~hook =
@@ -1337,6 +1318,7 @@ let create ~contexts ~file_tree ~hook =
     List.map contexts ~f:(fun c -> (c.Context.name, c))
     |> String.Map.of_list_exn
   in
+  let cache_static_deps = Memoization_cached.cached () in
   let t =
     { contexts
     ; files      = Path.Table.create 1024
@@ -1352,25 +1334,25 @@ let create ~contexts ~file_tree ~hook =
     ; files_of = Path.Table.create 1024
     ; prefix = None
     ; hook
-    ; load_dir_cache = Memoize.create_cache ()
-    ; build_rule_def = CRef.deferred ()
-    ; build_file_def = CRef.deferred ()
-    ; build_rule_internal_def = CRef.deferred ()
-    ; prepare_rule_def = CRef.deferred ()
-    ; load_dir_def = CRef.deferred ()
+    ; cache_static_deps
+    ; build_rule_def = Fdecl.create ()
+    ; build_file_def = Fdecl.create ()
+    ; build_rule_internal_def = Fdecl.create ()
+    ; prepare_rule_def = Fdecl.create ()
+    ; load_dir_def = Fdecl.create ()
     }
   in
   let fst_inp_spec = Memoization_specs.map ~f:(fun (r,_) -> r) rule_input_spec in
-  Memoize.memoization file_cache "prepare-rule" fst_inp_spec ignore_output_spec (prepare_rule t)
-  |> CRef.set t.prepare_rule_def;
-  Memoize.memoization file_cache "build-rule" fst_inp_spec ignore_output_spec (build_rule t)
-  |> CRef.set t.build_rule_def;
-  Memoize.memoization unit_cache "build-rule-internal" rule_input_spec ignore_output_spec (build_rule_internal t)
-  |> CRef.set t.build_rule_internal_def;
-  Memoize.memoization unit_cache "build-file" path_input_spec ignore_output_spec (build_file t)
-  |> CRef.set t.build_file_def;
-  Memoize.memoization path_cache "load-dir" dir_input_spec ignore_output_spec (fun dir -> targets_of t ~dir |> Fiber.return)
-  |> CRef.set t.load_dir_def;
+  Memoize.memoization "prepare-rule" fst_inp_spec Memoization_specs.ignore_output_spec (prepare_rule t)
+  |> Fdecl.set t.prepare_rule_def;
+  Memoize.memoization "build-rule" fst_inp_spec Memoization_specs.ignore_output_spec (build_rule t)
+  |> Fdecl.set t.build_rule_def;
+  Memoize.memoization "build-rule-internal" rule_input_spec Memoization_specs.ignore_output_spec (build_rule_internal t)
+  |> Fdecl.set t.build_rule_internal_def;
+  Memoize.memoization "build-file" path_input_spec Memoization_specs.ignore_output_spec (build_file t)
+  |> Fdecl.set t.build_file_def;
+  Memoize.memoization "load-dir" dir_input_spec Memoization_specs.ignore_output_spec (fun dir -> targets_of t ~dir |> Fiber.return)
+  |> Fdecl.set t.load_dir_def;
   Hooks.End_of_build.once (fun () -> finalize t);
   t
 
@@ -1477,7 +1459,7 @@ let rules_for_files rules deps =
 let build_rules_internal ?(recursive=false) t ~request =
   let rules = ref [] in
   let rec run_rule (rule : Internal_rule.t) =
-    (rule, rule.build) |> CRef.get t.prepare_rule_def
+    (rule, rule.build) |> Fdecl.get t.prepare_rule_def
     >>= (fun (action,deps) ->
       let rule = {
         Rule.
@@ -1570,7 +1552,7 @@ let package_deps t pkg files =
         ir.static_deps
         >>= (fun static_deps ->
           let rule_deps = Static_deps.rule_deps static_deps in
-          (ir, ir.build) |> CRef.get t.build_rule_def
+          (ir, ir.build) |> Fdecl.get t.build_rule_def
           >>= (fun (_,deps ) ->
             let dyn_deps = Deps.path_diff deps rule_deps in
             let action_deps = Static_deps.action_deps static_deps |> Deps.paths in
@@ -1719,7 +1701,7 @@ let register_computations bs cs =
     Dune_lang.Decoder.parse decoder Univ_map.empty sexp in
   let comp = (fun sexp ->
     decode sexp |> Fiber.return
-    >>= CRef.get bs.build_file_def
+    >>= Fdecl.get bs.build_file_def
     >>| (fun () -> Dune_lang.atom "built")
   ) in
   Computations.register cs ~key:"build-file" ~comp;
@@ -1730,7 +1712,7 @@ let register_computations bs cs =
     Dune_lang.Decoder.parse decoder Univ_map.empty sexp in
   let comp = (fun sexp ->
     decode sexp |> Fiber.return
-    >>= CRef.get bs.load_dir_def
+    >>= Fdecl.get bs.load_dir_def
     >>| (fun dat ->
       Path.Set.to_list dat
       |> List.map ~f:Path.to_string

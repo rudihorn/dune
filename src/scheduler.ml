@@ -698,7 +698,7 @@ let kill_and_wait_for_all_processes () =
 let go ?log ?config ?gen_status_line fiber =
   let t = prepare ?log ?config ?gen_status_line () in
   try
-    run t (fun () -> fiber)
+    run t (fun () -> Memoization.Memoize.run_memoize fiber)
   with exn ->
     kill_and_wait_for_all_processes ();
     raise exn

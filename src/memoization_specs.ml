@@ -70,3 +70,11 @@ let eager_function_output_spec = {
   cutoff_policy = No_cutoff;
 }
 
+let empty_string _ = "" 
+let ignore_output_spec = {
+  Memoization.
+  serialize = empty_string;
+  print = empty_string;
+  cutoff_policy = Cutoff;
+}
+

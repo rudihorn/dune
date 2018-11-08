@@ -6,7 +6,7 @@ Michael A. Bender, Jeremy T. Fineman, Seth Gilbert, and Robert E. Tarjan. 2015. 
 
 *)
 
-module Kind = struct 
+module Kind = struct
   type 'a tag = ..
 
   module type S = sig
@@ -126,12 +126,20 @@ let add v w =
         false
     end in
 
+  let rec reconstruct_b_path y acc x =
+    if x.id = y.id then
+      Some (acc)
+    else
+    List.find_map ~f:(reconstruct_b_path y (x :: acc)) x.rev_deps in
+
   let rec fvisit x acc =
     List.iter x.deps ~f:(fun y -> ftraverse x y (y :: acc));
     f := x :: !f
   and ftraverse x y acc =
-    if y.id = v.id || List.exists ~f:(fun n -> n.id = y.id) !b then
-      Cycle (PackedList { nodes = acc; kind = dag.kind }) |> raise;
+    if y.id = v.id || List.exists ~f:(fun n -> n.id = y.id) !b then begin
+      let path = reconstruct_b_path y [] v |> Option.value_exn in
+      Cycle (PackedList { nodes = List.append path acc; kind = dag.kind }) |> raise
+    end;
     if y.level < w.level then begin
       y.level <- w.level;
       y.rev_deps <- [];

@@ -29,28 +29,75 @@ type 'a output_spec = {
    the output is up-to-date *)
 type update_cache = unit -> ser_output Fiber.t
 
-type 'output run_state =
-  | Running of 'output Fiber.Ivar.t
-  | Done of 'output
+module Id = Id.Make()
+
+module Kind = struct
+  type 'a tag = ..
+
+  module type S = sig
+    type t
+    type 'a tag += X : t tag
+  end
+
+  type 'a t = (module S with type t = 'a)
+
+  let create (type a) () =
+    let module M = struct
+      type t = a
+      type 'a tag += X : t tag
+    end in
+    (module M : S with type t = a)
+
+  let eq (type a) (type b)
+        (module A : S with type t = a)
+        (module B : S with type t = b)
+    : (a, b) Type_eq.t option =
+    match A.X with
+    | B.X -> Some Type_eq.T
+    | _   -> None
+end
+
+module Output = struct
+  type 'output run_state =
+    | Running of 'output Fiber.Ivar.t
+    | Done of 'output
+
+  type 'a output_cache = {
+    state : 'a run_state;
+    kind : 'a Kind.t;
+  }
+
+  type packed_output = Packed : _ output_cache -> packed_output
+
+  let unpack : type a. a Kind.t -> packed_output -> a run_state =
+    fun kind packed ->
+      match packed with
+      |  Packed output ->
+        let Type_eq.T = Kind.eq (output.kind) kind |> Option.value_exn in
+        output.state
+
+  let pack kind v = Packed {
+    state = v;
+    kind = kind;
+  }
+end
 
 type global_cache_info = {
   last_output : ser_output;
   update : update_cache;
   cutoff_policy : cutoff_policy;
-  last_deps : (name * ser_input * ser_output) list;
+  last_deps : (dep_node * ser_output) list;
 }
 
-module Id = Id.Make()
-
-let global_cache_table : (name * ser_input, global_cache_info) Hashtbl.t = Hashtbl.create 256
-
-type dep_info = {
+and dep_info = {
   name : name;
   input : ser_input;
   id : Id.t;
+  mutable cache : global_cache_info option;
+  mutable output : Output.packed_output option;
 }
 
-type dep_node = dep_info Dag.node
+and dep_node = dep_info Dag.node
 
 module Stack_frame = struct
   type t = {
@@ -118,16 +165,6 @@ module Fdecl = struct
 end
 
 module Memoize = struct
-
-  type 'output output_cache = {
-    state : 'output run_state;
-    id : Id.t;
-  }
-
-  type 'out t = {
-    cache : (name * ser_input, 'out output_cache) Hashtbl.t;
-  }
-
   (* fiber context variable keys *)
   let dep_key = Fiber.Var.create ()
   let call_stack_key = Fiber.Var.create ()
@@ -170,11 +207,6 @@ module Memoize = struct
   (* set up the fiber so that it both has an up to date call stack
      as well as an empty dependency table *)
   let wrap_fiber (stack_frame : Stack_frame.t) id (f : 'a Fiber.t) =
-    let dep_ref = ref [] in
-    (* transform f so it returns the dependencies after the computation *)
-    let f = f >>= fun res -> Fiber.return (res,!dep_ref) in
-    (* change f so it sets up a new dependency table before computation *)
-    let f = Fiber.Var.set dep_key dep_ref f in
     (* set the context so that f has the call stack  *)
     get_call_stack_int
       >>| (fun (stack, set) -> stack_frame :: stack, Id.Set.add set id) (* add top entry *)
@@ -199,32 +231,6 @@ module Memoize = struct
   let ignore_deps fiber =
     Fiber.Var.set dep_key (ref []) fiber
 
-  let last_global_cache (name : name) (inp : ser_input) =
-    Hashtbl.find global_cache_table (name, inp)
-
-  let last_global_cache_exn (name : name) (inp : ser_input) : global_cache_info =
-    Hashtbl.find global_cache_table (name, inp) |>
-    function
-      | Some e -> e
-      | None ->
-        Printf.printf "No global memoized cache entry for (%s, %s). Did it crash?\n%!" name inp;
-        die "Error"
-
-  let last_global_output_exn (name : name) (inp : ser_input) =
-      last_global_cache_exn name inp |> (fun r -> r.last_output)
-
-  let last_output_cache (v : 'b t) (name : name) (inp : ser_input) =
-    Hashtbl.find v.cache (name, inp)
-
-  let _last_output_cache_exn (v : 'b t) (name : name) (inp : ser_input) =
-    last_output_cache v name inp |> Option.value_exn
-
-  let update_cache (v : 'b t) (name : name) (inp : ser_input) (rinfo : 'b output_cache) =
-    Hashtbl.replace v.cache ~key:(name, inp) ~data:rinfo
-
-  let update_global_cache (name : name) (inp : ser_input) (outp : global_cache_info) =
-    Hashtbl.replace global_cache_table ~key:(name, inp) ~data:outp
-
   let get_dependency_node (name : name) (inp : ser_input) : dep_node =
     Hashtbl.find global_dep_table (name, inp)
     |> function
@@ -234,6 +240,8 @@ module Memoize = struct
           id = newId;
           name = name;
           input = inp;
+          cache = None;
+          output = None;
         } in
         let node = Dag.node global_dep_dag entry in
         Hashtbl.replace global_dep_table ~key:(name,inp) ~data:node;
@@ -258,21 +266,23 @@ module Memoize = struct
               } |> raise
 
   let get_deps (name : name) (inp : ser_input) =
-    let c = last_global_cache name inp in
-    Option.map ~f:(fun r -> r.last_deps |> List.map ~f:(fun (n,i,_u) -> n,i)) c
+    let dep_info = get_dependency_node name inp in
+    Option.map ~f:(fun r -> r.last_deps |> List.map ~f:(fun (n,_u) ->
+      let node = Dag.get n in
+      node.name,node.input)) (Dag.get dep_info).cache
 
   let rec list_any l =
     match l with
     | [] -> false
     | x :: xs -> if x then true else list_any xs
 
-  let dependencies_updated id rinfo =
-    rinfo.last_deps |> Fiber.parallel_map ~f:(fun (dep, inp, outp) ->
+  let dependencies_updated rinfo =
+    rinfo.last_deps |> Fiber.parallel_map ~f:(fun (dep, outp : dep_node * ser_output) ->
+      let node = Dag.get dep in
       (* rerun the computation to transitively check / update dependencies *)
-      let last_res = last_global_cache dep inp in
       let not_equal =
         Option.map ~f:(fun res ->
-          checked_or_check id
+          checked_or_check node.id
           >>= (function
           | true -> Fiber.return res.last_output
           | false -> res.update ())
@@ -281,43 +291,36 @@ module Memoize = struct
             | No_cutoff -> true
             | Cutoff -> outp <> cur_outp
           )
-        ) last_res in
+        ) node.cache in
       Option.value ~default:(true |> Fiber.return) not_equal
     )
     (* if any of the dependencies has changed we need to update *)
     >>| (fun dat -> list_any dat)
 
-  let create_cache () =
-    {
-      cache = Hashtbl.create 256;
-    }
-
-  let set_running_output_cache cache name ser_inp id fut =
-    let rinfo = {
-      state = Running fut;
-      id = id;
-    } in
-    update_cache cache name ser_inp rinfo;
+  let set_running_output_cache kind dep_node fut =
+    let di = Dag.get dep_node in
+    di.output <- Some (Output.Running fut |> Output.pack kind);
     Fiber.return fut
 
-  let update_caches cache name ser_inp out_spec id updatefn (res, deps) =
-    let rinfo = {
-      state = Done res;
-      id = id;
-    } in
+  let update_caches kind (dep_node : dep_node) out_spec updatefn res =
     let goinfo = {
-      last_deps = deps |> List.map ~f:(fun (d,i) ->
-        d,i, last_global_output_exn d i);
+      last_deps =
+        Dag.children dep_node
+        |> List.map ~f:(fun (n : dep_node) ->
+          let node = Dag.get n in
+          n, (Option.value_exn node.cache).last_output
+        );
       last_output = out_spec.serialize res;
       cutoff_policy = out_spec.cutoff_policy;
       update = updatefn;
     } in
-    update_global_cache name ser_inp goinfo;
-    update_cache cache name ser_inp rinfo;
+    let di = Dag.get dep_node in
+    di.cache <- Some goinfo;
+    di.output <- Some (Output.Done res |> Output.pack kind);
     Fiber.return res
 
   let memoization (name : name) (in_spec : 'a input_spec) (out_spec : 'b output_spec) (comp : 'a -> 'b Fiber.t) : ('a -> 'b Fiber.t) =
-    let cache = create_cache () in
+    let kind = Kind.create () in
 
     (* the computation that force computes the fiber *)
     let recompute inp dep_node comp updatefn =
@@ -325,14 +328,14 @@ module Memoize = struct
       (* create an ivar so other threads can wait for the computation to finish *)
       let ivar : 'b Fiber.Ivar.t = Fiber.Ivar.create () in
       (* create an output cache entry with our ivar *)
-      set_running_output_cache cache name di.input di.id ivar
+      set_running_output_cache kind dep_node ivar
       (* define the function to update / double check intermediate result *)
       (* set context of computation then run it *)
       >>= (fun _ ->
         comp inp |> wrap_fiber { dep_node } di.id)
       >>= check di.id (* mark the current node as up to date *)
       (* update the output cache with the correct value *)
-      >>= update_caches cache name di.input out_spec di.id updatefn
+      >>= update_caches kind dep_node out_spec updatefn
       (* fill the ivar for any waiting threads *)
       >>= (fun res -> Fiber.Ivar.fill ivar res >>= fun _ -> Fiber.return res) in
 
@@ -340,7 +343,7 @@ module Memoize = struct
        any inputs have been updated otherwise return the cached
        value *)
     let cached_computation inp (dep_node : dep_node) ginfo res updatefn =
-      dependencies_updated (Dag.get dep_node).id ginfo |> ignore_deps
+      dependencies_updated ginfo |> ignore_deps
       >>= (fun updated ->
         if updated then
           recompute inp dep_node comp updatefn
@@ -351,31 +354,31 @@ module Memoize = struct
     (* determine if the function is still executing *)
     let caching_computation inp (dep_node : dep_node) rinfo updatefn =
       let di = Dag.get dep_node in
-      match rinfo.state with
-      | Running fut ->
+      match rinfo with
+      | Output.Running fut ->
         Fiber.Ivar.read fut
-      | Done res ->
-        let ginfo = last_global_cache_exn name di.input in
+      | Output.Done res ->
+        let ginfo = di.cache |> Option.value_exn in
         cached_computation inp dep_node ginfo res updatefn in
 
     (* determine if there is an output cache entry *)
-    let rec loop () = fun inp ->
+    fun inp ->
       let ser_inp = in_spec.serialize inp in
-      Fiber.return inp
-      >>= (fun inp ->
-        let dep_info = get_dependency_node name ser_inp in
-        (* generate the function which recomputes the memoized function
-           to ensure it is up to date *)
-        let updatefn =
-          inp
-          |> loop ()
-          |> (fun a () -> a >>| out_spec.serialize) in
-        add_rev_dep dep_info
-        >>> add_dep name ser_inp inp
-        >>| (fun _ -> last_output_cache cache name ser_inp)
-        >>= (function
-            | None -> recompute inp dep_info comp updatefn
-            | Some rinfo -> caching_computation inp dep_info rinfo updatefn)
-      ) in
-    loop ()
+      let dep_info = get_dependency_node name ser_inp in
+      let rec loop () =
+        Fiber.return inp
+        >>= (fun inp ->
+          (* generate the function which recomputes the memoized function
+            to ensure it is up to date *)
+          let updatefn =
+            loop ()
+            |> (fun a () -> a >>| out_spec.serialize) in
+          add_rev_dep dep_info
+          >>> add_dep name ser_inp inp
+          >>| (fun _ -> (Dag.get dep_info).output |> Option.map ~f:(Output.unpack kind))
+          >>= (function
+              | None -> recompute inp dep_info comp updatefn
+              | Some rinfo -> caching_computation inp dep_info rinfo updatefn)
+        ) in
+      loop ()
 end

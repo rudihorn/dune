@@ -1,7 +1,7 @@
 module type S = sig
   type t
 
-  module Set : Set_intf.S with type elt = t
+  module Set : Set.S with type elt = t
 
   val gen : unit -> t
   val peek : unit -> t
@@ -9,8 +9,7 @@ module type S = sig
   val compare : t -> t -> Ordering.t
 end
 
-
-module Make () = struct
+module Make () : S = struct
   module Set = Int.Set
 
   type t = int
@@ -22,8 +21,7 @@ module Make () = struct
     next := v + 1;
     v
 
-  let peek () =
-    !next
+  let peek () = !next
 
   let to_int x = x
 

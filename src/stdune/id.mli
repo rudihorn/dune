@@ -1,5 +1,3 @@
-open !Set
-
 module type S = sig
   type t
 

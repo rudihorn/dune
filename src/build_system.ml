@@ -114,8 +114,8 @@ end
 (* Memoization caches *)
 
 let path_input_spec =
-  let ser (c, _) = Path.to_string c in
-  let ne (a,_) (b,_) = a <> b in
+  let ser p = Path.to_string p in
+  let ne x y = x <> y in
   {
     Memoization.
     serialize = ser;
@@ -135,13 +135,6 @@ let rule_id_input_spec =
 
 let rule_input_spec =
   Memoization_specs.map ~f:(fun (r : Internal_rule.t) -> r.id) rule_id_input_spec
-
-let dir_input_spec = {
-  Memoization.
-  serialize = Path.to_string;
-  print = Path.to_string;
-  not_equal = (fun a b -> a <> b);
-}
 
 module File_kind = struct
   type 'a t =
@@ -405,7 +398,7 @@ type t =
   ; (* Package files are part of *)
     packages : Package.Name.t Path.Table.t
   (* memoized functions *)
-  ; cache_static_deps : (Memoization_cached.Id.t * Static_deps.t Fiber.t) -> (Static_deps.t Fiber.t)
+  ; cache_static_deps : Static_deps.t Memoization_cached.t
   ; prepare_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) Fdecl.comp
   ; build_rule_def : (Internal_rule.t * (unit, Action.t) Build.t, Action.t * Deps.t) Fdecl.comp
   ; build_file_def : (Path.t * Loc.t option, unit) Fdecl.comp
@@ -1343,15 +1336,16 @@ let create ~contexts ~file_tree ~hook =
     }
   in
   let fst_inp_spec = Memoization_specs.map ~f:(fun (r,_) -> r) rule_input_spec in
+  let fst_path_inp_spec = Memoization_specs.map ~f:(fun (p,_) -> p) path_input_spec in
   Memoize.memoization "prepare-rule" fst_inp_spec Memoization_specs.ignore_output_spec (prepare_rule t)
   |> Fdecl.set t.prepare_rule_def;
   Memoize.memoization "build-rule" fst_inp_spec Memoization_specs.ignore_output_spec (build_rule t)
   |> Fdecl.set t.build_rule_def;
   Memoize.memoization "build-rule-internal" rule_input_spec Memoization_specs.ignore_output_spec (build_rule_internal t)
   |> Fdecl.set t.build_rule_internal_def;
-  Memoize.memoization "build-file" path_input_spec Memoization_specs.ignore_output_spec (build_file t)
+  Memoize.memoization "build-file" fst_path_inp_spec Memoization_specs.ignore_output_spec (build_file t)
   |> Fdecl.set t.build_file_def;
-  Memoize.memoization "load-dir" dir_input_spec Memoization_specs.ignore_output_spec (fun dir -> targets_of t ~dir |> Fiber.return)
+  Memoize.memoization "load-dir" path_input_spec Memoization_specs.ignore_output_spec (fun dir -> targets_of t ~dir |> Fiber.return)
   |> Fdecl.set t.load_dir_def;
   Hooks.End_of_build.once (fun () -> finalize t);
   t

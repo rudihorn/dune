@@ -11,7 +11,6 @@ module Id         = Id
 module Io         = Io
 module List       = List
 module Map        = Map
-module Once       = Once
 module Option     = Option
 module Or_exn     = Or_exn
 module Ordering   = Ordering

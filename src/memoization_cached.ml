@@ -4,6 +4,8 @@ open Memoization_specs
 
 module Id = Id.Make ()
 
+type 'a t = Id.t * 'a Fiber.t -> 'a Fiber.t
+
 let id_input_spec =
   let ser x = Id.to_int x |> string_of_int in
   let ne x y = x <> y in

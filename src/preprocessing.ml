@@ -18,6 +18,7 @@ module Key : sig
 end = struct
 
   let reverse_table = Hashtbl.create 128
+  let () = Hooks.End_of_build.always (fun () -> Hashtbl.reset reverse_table)
 
   let encode ~dir_kind libs =
     let libs =
@@ -25,7 +26,7 @@ end = struct
       match (dir_kind : File_tree.Dune_file.Kind.t) with
       | Dune -> List.sort libs ~compare
       | Jbuild ->
-        match libs with
+        match List.rev libs with
         | last :: others -> List.sort others ~compare @ [last]
         | [] -> []
     in

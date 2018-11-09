@@ -30,6 +30,7 @@ type 'a output_spec = {
 type update_cache = unit -> ser_output Fiber.t
 
 module RunId = Id.Make ()
+module FnId = Id.Make ()
 module Id = Id.Make()
 
 module Kind = struct
@@ -140,7 +141,9 @@ end
 
 
 let global_dep_dag = Dag.create ()
-let global_dep_table : (name * ser_input, dep_node) Hashtbl.t = Hashtbl.create 256
+let global_dep_table : (FnId.t * ser_input, dep_node) Hashtbl.t = Hashtbl.create 256
+
+let global_id_table : (name, FnId.t) Hashtbl.t = Hashtbl.create 256
 
 module Fdecl = struct
   type ('a, 'b) t = 'a -> 'b Fiber.t
@@ -198,8 +201,8 @@ module Memoize = struct
         List.iter ~f:(fun st -> Printf.printf "   %s %s\n" (Stack_frame.name st) (Stack_frame.input st)))
       >>| (fun _ -> v)
 
-  let get_dependency_node (name : name) (inp : ser_input) : dep_node =
-    Hashtbl.find global_dep_table (name, inp)
+  let get_dependency_node (fn_id : FnId.t) (name : name) (inp : ser_input) : dep_node =
+    Hashtbl.find global_dep_table (fn_id, inp)
     |> function
       | None ->
         let newId = Id.gen () in
@@ -211,7 +214,7 @@ module Memoize = struct
           output = None;
         } in
         let node = Dag.node global_dep_dag entry in
-        Hashtbl.replace global_dep_table ~key:(name,inp) ~data:node;
+        Hashtbl.replace global_dep_table ~key:(fn_id,inp) ~data:node;
         node
       | Some t -> t
 
@@ -232,8 +235,17 @@ module Memoize = struct
                 cycle = cycle;
               } |> raise
 
+  let get_name_id (name : name) =
+    match Hashtbl.find global_id_table name with
+    | None ->
+      let id = FnId.gen () in
+      Hashtbl.replace global_id_table ~key:name ~data:id;
+      id
+    | Some id -> id
+
   let get_deps (name : name) (inp : ser_input) =
-    let dep_info = get_dependency_node name inp in
+    let id = get_name_id name in
+    let dep_info = get_dependency_node id name inp in
     Option.map ~f:(fun r -> r.last_deps |> List.map ~f:(fun (n,_u) ->
       let node = Dag.get n in
       node.name,node.input)) (Dag.get dep_info).cache
@@ -302,6 +314,7 @@ module Memoize = struct
 
   let memoization (name : name) (in_spec : 'a input_spec) (out_spec : 'b output_spec) (comp : 'a -> 'b Fiber.t) : ('a -> 'b Fiber.t) =
     let kind = Kind.create () in
+    let fn_id = get_name_id name in
 
     (* the computation that force computes the fiber *)
     let recompute inp dep_node comp updatefn =
@@ -344,7 +357,7 @@ module Memoize = struct
     (* determine if there is an output cache entry *)
     fun inp ->
       let ser_inp = in_spec.serialize inp in
-      let dep_info = get_dependency_node name ser_inp in
+      let dep_info = get_dependency_node fn_id name ser_inp in
       let rec loop () =
         Fiber.return inp
         >>= (fun inp ->
